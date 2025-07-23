@@ -575,7 +575,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
       updateLayerVisibility(initialZoom);
 
       // Fit bounds
-      let allLayers = [];
+      const allLayers = [];
       if (clusterGroup.getLayers().length > 0) {
         allLayers.push(clusterGroup);
       }
