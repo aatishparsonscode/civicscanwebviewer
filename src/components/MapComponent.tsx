@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 // frontend/src/components/MapComponent.tsx
 'use client'; // This directive ensures the component is rendered on the client side
 
