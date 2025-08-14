@@ -38,7 +38,7 @@ export default function MultiS3GeoJSONMapPage() {
   const sidebarWidth = getSidebarWidth(); // Calculate once per render cycle when screen size changes
 
   async function listResultsGeojsonUrls(): Promise<string[]> {
-    const prefix = 'results_redmond_downtown_10/';
+    const prefix = 'results_redmond_downtown/';
     const delimiter = '/';
     const baseUrl = 'https://civicscan-aatishparson-bucket-03-18-2004.s3.amazonaws.com';
 
