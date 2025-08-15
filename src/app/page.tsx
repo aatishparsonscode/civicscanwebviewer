@@ -12,7 +12,11 @@ export default function HomePage() {
           </h1>
           
           <p className="subtitle">
-            Automatically detect cracks, assess road roughness, and map infrastructure conditions — all in real time with cutting-edge computer vision technology.
+            Automatically detect cracks, assess road roughness, and visualize road conditions — quicker and cheaper than ever.
+          </p>
+
+          <p className="subtitle">
+            All you need is a phone.
           </p>
           
           <div className="cta-buttons">
@@ -27,9 +31,9 @@ export default function HomePage() {
           <div className="features-preview">
             <div className="feature-card floating">
               <div className="feature-icon">🛣️</div>
-              <h3 className="feature-title">Real-Time Detection</h3>
+              <h3 className="feature-title">Scalable Detection</h3>
               <p className="feature-description">
-                Advanced AI algorithms instantly identify and classify pavement defects as you drive.
+                Advanced AI algorithms identify and classify pavement defects as you drive with high accuracy.
               </p>
             </div>
             
@@ -37,7 +41,7 @@ export default function HomePage() {
               <div className="feature-icon">📊</div>
               <h3 className="feature-title">Smart Analytics</h3>
               <p className="feature-description">
-                Generate comprehensive reports and insights to prioritize maintenance and optimize budgets.
+                Generate and export comprehensive reports and insights to prioritize maintenance, apply for grants, and optimize budgets.
               </p>
             </div>
             
@@ -242,7 +246,7 @@ export default function HomePage() {
 
         @media (max-width: 640px) {
           .hero-container {
-            padding: 1.5rem 1rem;
+            padding: calc(64px + 1.5rem) 1rem 1.5rem; /* 64px = header height */
           }
           
           .cta-buttons {
