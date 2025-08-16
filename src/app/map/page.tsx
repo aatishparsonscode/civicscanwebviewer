@@ -257,7 +257,7 @@ export default function MultiS3GeoJSONMapPage() {
         fontSize: '0.9rem',
         fontWeight: '500',
         textAlign: 'center',
-        maxWidth: '90vw',
+        maxWidth: '150vw',
         boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
       }}>
         <div style={{ marginBottom: '0.25rem' }}>
