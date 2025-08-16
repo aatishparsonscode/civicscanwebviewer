@@ -181,7 +181,7 @@ export default function MultiS3GeoJSONMapPage() {
               }
             }}
           >
-            {loading ? 'Loading... (allow couple seconds)' : 'Load Maps'}
+            {loading ? 'Loading... (allow ~10 seconds)' : 'Load Maps'}
           </button>
 
           {loading && (
