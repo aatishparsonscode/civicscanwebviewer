@@ -24,8 +24,8 @@ export default function Navbar() {
           </Link>
           
           <div className="nav-links desktop-only">
-            <Link href="/" className="nav-link" style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
-              Home
+            <Link href="/about" className="nav-link" style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
+              Learn More
             </Link>
             <Link href="/map" className="nav-link" style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
               Live Map
