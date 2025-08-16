@@ -257,6 +257,8 @@ export default function MultiS3GeoJSONMapPage() {
         fontSize: '0.9rem',
         fontWeight: '500',
         textAlign: 'center',
+        width: 'fit-content',
+        whiteSpace: 'nowrap',  // This prevents text wrapping
         maxWidth: '90vw',
         boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
       }}>
