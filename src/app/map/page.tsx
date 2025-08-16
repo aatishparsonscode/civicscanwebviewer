@@ -261,6 +261,9 @@ export default function MultiS3GeoJSONMapPage() {
         boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
       }}>
         <div style={{ marginBottom: '0.25rem' }}>
+          <strong>AI Model under development</strong> - false positives still present
+        </div>
+        <div style={{ marginBottom: '0.25rem' }}>
           📍 <strong>Zoom in</strong> to see clusters of cracks • <strong>Click clusters</strong> to see all cracks
         </div>
         <div style={{ fontSize: '0.8rem', opacity: '0.8' }}>

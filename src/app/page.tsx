@@ -91,7 +91,7 @@ export default function HomePage() {
             <div className="section-header scroll-animate">
               <h3 className="section-title">See AI Detection in Action</h3>
               <p className="section-description">
-                Our advanced machine learning models automatically identify and highlight pavement defects in real-time as you drive.
+                After installing our <strong>mobile app</strong>, you can simply record the road and let our advanced machine learning models automatically identify and highlight pavement defects.
               </p>
             </div>
 
