@@ -62,9 +62,39 @@ export default function MultiS3GeoJSONMapPage() {
     setSuccessMessage(null);
     setGeojson(null);
 
+    // Retry helper function with exponential backoff
+    const fetchWithRetry = async (url: string, maxRetries = 3): Promise<Response> => {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const response = await fetch(url);
+          
+          // If it's a 404 and we have retries left, wait and try again
+          if (response.status === 404 && attempt < maxRetries) {
+            const delay = Math.min(1000 * Math.pow(2, attempt), 4000); // Cap at 4 seconds
+            console.log(`404 for ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries + 1})`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          
+          return response;
+        } catch (err) {
+          // For network errors, also retry
+          if (attempt < maxRetries) {
+            const delay = Math.min(1000 * Math.pow(2, attempt), 4000);
+            console.log(`Network error for ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries + 1})`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          throw err;
+        }
+      }
+      
+      // This shouldn't be reached, but TypeScript needs it
+      throw new Error('Max retries exceeded');
+    };
+
     try {
       const geojsonUrls = await listResultsGeojsonUrls();
-
       if (geojsonUrls.length === 0) {
         setError('No scan folders found in results_redmond_downtown/.');
         setLoading(false);
@@ -76,20 +106,34 @@ export default function MultiS3GeoJSONMapPage() {
 
       const fetchPromises = geojsonUrls.map(async (geojsonUrl, index) => {
         try {
-          const response = await fetch(geojsonUrl);
-          if (!response.ok){
-            console.log(`HTTP ${response.status}`);
-            throw new Error(`HTTP ${response.status}`);
-          } 
-          const fetchedGeojson = await response.json();
+          const encodedUrl = encodeURI(geojsonUrl);
+          const response = await fetchWithRetry(encodedUrl);
+          
+          if (!response.ok) {
+            console.log(`HTTP fail for ${geojsonUrl}, status: ${response.status}`);
+            failedUrls.push(geojsonUrl);
+            return;
+          }
+
+          // Step 1: Get the raw response text
+          const rawText = await response.text();
+          
+          // Step 2: Manually replace 'NaN' with a valid JSON value like 'null'
+          // We use a regular expression to find all instances of ': NaN'
+          const correctedText = rawText.replace(/: NaN/g, ': null');
+          
+          // Step 3: Parse the corrected string as JSON
+          const fetchedGeojson = JSON.parse(correctedText);
+          
           fetchedGeojson.features.forEach((feature: any) => {
             feature.properties.sourceUrl = geojsonUrl;
             feature.properties.sourceIndex = index;
-            feature.properties.globalTimestamp =  parseInt(fetchedGeojson.metadata.scan_info.timestamp) + parseInt(feature.properties.frame_number);
+            const timestamp = fetchedGeojson.metadata?.scan_info?.timestamp;
+            const frameNumber = feature.properties?.frame_number;
+            feature.properties.globalTimestamp = parseInt(timestamp) + parseInt(frameNumber);
           });
-
+          
           allFeatures = allFeatures.concat(fetchedGeojson.features);
-
         } catch (err: any) {
           failedUrls.push(geojsonUrl);
           console.error(`Error loading ${geojsonUrl}`, err);
@@ -97,7 +141,8 @@ export default function MultiS3GeoJSONMapPage() {
       });
 
       await Promise.allSettled(fetchPromises);
-
+      console.log("could not retrieve:")
+      console.log(failedUrls)
       if (allFeatures.length > 0) {
         const combinedGeoJSON = {
           type: 'FeatureCollection',
@@ -108,6 +153,7 @@ export default function MultiS3GeoJSONMapPage() {
             processedAt: new Date().toISOString(),
           },
         };
+        
         setGeojson(combinedGeoJSON);
         setSuccessMessage(`Loaded ${allFeatures.length} crack-containing frames from ${geojsonUrls.length - failedUrls.length} sources.`);
       } else {
@@ -250,7 +296,7 @@ export default function MultiS3GeoJSONMapPage() {
         zIndex: 1000,
         background: 'rgba(0, 0, 0, 0.8)',
         color: 'white',
-        padding: '0.75rem 1.5rem',
+        padding: '0.75rem 1rem',
         borderRadius: '12px',
         backdropFilter: 'blur(10px)',
         border: '1px solid rgba(255, 255, 255, 0.1)',
@@ -263,10 +309,10 @@ export default function MultiS3GeoJSONMapPage() {
         boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
       }}>
         <div style={{ marginBottom: '0.25rem' }}>
-          <strong>AI Model under development</strong> - false positives still present
+          <strong>AI Model under development</strong> - false positives remain
         </div>
         <div style={{ marginBottom: '0.25rem' }}>
-          📍 <strong>Zoom in</strong> and click clusters and pins to see cracks
+          📍 <strong>Zoom in</strong> and click clusters/dots to see cracks
         </div>
       </div>
 

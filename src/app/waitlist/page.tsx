@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 
 export default function WaitlistPage() {
   const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
   const [occupation, setOccupation] = useState('');
   const [organization, setOrganization] = useState('');
   const [useCase, setUseCase] = useState('');
@@ -16,10 +17,11 @@ export default function WaitlistPage() {
     
     try {
       // Replace with your Google Apps Script Web App URL
-      const scriptUrl = 'https://script.google.com/macros/s/AKfycbz1T34ThUfdMkZfFRxq1KmkVK4FyQ62P-QWgce76GmCp1o-e0exiuFbqimN7m3K7fvS/exec';
+      const scriptUrl = 'https://script.google.com/macros/s/AKfycbzz5kJqpRqCfNODmAS_p0Cl7yYqslC7nxLbw0l6XnOV3rkrJRy8BCBDBXX3RnBERXim/exec';
       
       const formData = new FormData();
       formData.append('name', name);
+      formData.append('email', email);
       formData.append('occupation', occupation);
       formData.append('organization', organization);
       formData.append('useCase', useCase);
@@ -199,6 +201,19 @@ export default function WaitlistPage() {
                     onChange={(e) => setName(e.target.value)}
                     className="form-input"
                     placeholder="Enter your full name"
+                    required
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label htmlFor="email" className="form-label">Email Address *</label>
+                  <input
+                    type="email"
+                    id="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="form-input"
+                    placeholder="your.email@example.com"
                     required
                   />
                 </div>
