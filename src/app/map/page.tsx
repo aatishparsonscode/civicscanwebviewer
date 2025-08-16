@@ -257,17 +257,14 @@ export default function MultiS3GeoJSONMapPage() {
         fontSize: '0.9rem',
         fontWeight: '500',
         textAlign: 'center',
-        maxWidth: '150vw',
+        maxWidth: '90vw',
         boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
       }}>
         <div style={{ marginBottom: '0.25rem' }}>
           <strong>AI Model under development</strong> - false positives still present
         </div>
         <div style={{ marginBottom: '0.25rem' }}>
-          📍 <strong>Zoom in</strong> to see clusters of cracks • <strong>Click clusters</strong> to see all cracks
-        </div>
-        <div style={{ fontSize: '0.8rem', opacity: '0.8' }}>
-          Zoom in more to see each crack pinpointed
+          📍 <strong>Zoom in</strong> and click clusters and pins to see cracks
         </div>
       </div>
 
