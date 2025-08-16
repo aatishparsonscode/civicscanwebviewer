@@ -181,7 +181,7 @@ export default function MultiS3GeoJSONMapPage() {
               }
             }}
           >
-            {loading ? 'Loading...' : 'Load Maps'}
+            {loading ? 'Loading... (allow couple seconds)' : 'Load Maps'}
           </button>
 
           {loading && (
@@ -238,6 +238,33 @@ export default function MultiS3GeoJSONMapPage() {
             setIsSidebarOpen={setIsSidebarOpen} 
             sidebarWidth={sidebarWidth}
           />
+        </div>
+      </div>
+
+      {/* Instructions overlay */}
+      <div style={{
+        position: 'fixed',
+        bottom: '20px',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 1000,
+        background: 'rgba(0, 0, 0, 0.8)',
+        color: 'white',
+        padding: '0.75rem 1.5rem',
+        borderRadius: '12px',
+        backdropFilter: 'blur(10px)',
+        border: '1px solid rgba(255, 255, 255, 0.1)',
+        fontSize: '0.9rem',
+        fontWeight: '500',
+        textAlign: 'center',
+        maxWidth: '90vw',
+        boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
+      }}>
+        <div style={{ marginBottom: '0.25rem' }}>
+          📍 <strong>Zoom in</strong> to see clusters of cracks • <strong>Click clusters</strong> to see all cracks
+        </div>
+        <div style={{ fontSize: '0.8rem', opacity: '0.8' }}>
+          Zoom in more to see each crack pinpointed
         </div>
       </div>
 

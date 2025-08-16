@@ -23,6 +23,12 @@ import * as EsriLeaflet from 'esri-leaflet';
 // Import Turf.js modules
 import * as turf from '@turf/turf';
 
+const crack_types = {
+  0: "Crack",
+  1 : "Sealed crack",
+  2 : "Pothole"
+}
+
 // FIX: This is a common workaround for Leaflet's default icon paths in bundlers like Webpack/Next.js
 // Without this, default markers might appear as broken images.
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -326,11 +332,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
         let clickPopupContent = `
           <div style="max-width: 330px; font-family: 'Inter', sans-serif;">
             <h3 style="margin: 0 0 10px 0; color: #333; font-size: 1.1em;">Frame Details</h3>
-            <p style="margin: 2px 0;"><strong>Distance:</strong> ${properties.actual_distance_feet?.toFixed(1) ?? 'N/A'} ft</p>
-            <p style="2px 0;"><strong>Speed:</strong> ${properties.speed_mph?.toFixed(1) ?? 'N/A'} mph</p>
-            <p style="margin: 2px 0;"><strong>Frame Type:</strong> ${properties.frame_type ?? 'N/A'}</p>
-            <p style="margin: 2px 0;"><strong>Frame #:</strong> ${properties.frame_number ?? 'N/A'}</p>
-            <p style="margin: 2px 0;"><strong>GPS Index:</strong> ${properties.gps_index ?? 'N/A'}</p>
+     
             <p style="margin: 2px 0;"><strong>Timestamp:</strong> ${properties.globalTimestamp ? new Date(properties.globalTimestamp).toLocaleString() : 'N/A'}</p>
         `;
 
@@ -363,10 +365,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
           properties.all_detections_in_frame.forEach((det: any, index: number) => {
             clickPopupContent += `
               <li style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: ${index < properties.all_detections_in_frame.length - 1 ? '1px dashed #ddd' : 'none'};">
-                <p style="margin: 0;"><strong>Defect ${index + 1}:</strong></p>
-                <p style="margin: 0 0 2px 10px; font-size: 0.9em;">Class ID: ${det.class_id ?? 'N/A'}, Confidence: ${det.confidence?.toFixed(2) ?? 'N/A'}</p>
-                <p style="margin: 0 0 0 10px; font-size: 0.9em;">BBox: [${det.bbox ? det.bbox.map((coord: number) => coord.toFixed(0)).join(', ') : 'N/A'}]</p>
-              </li>
+                <p style="margin: 0;"><strong>Defect type: ${crack_types[det.class_id]}</strong></p>
+                <p style="margin: 0 0 2px 10px; font-size: 0.9em;">Confidence: ${det.confidence?.toFixed(2) ?? 'N/A'}</p>
+               
             `;
           });
           clickPopupContent += `
@@ -389,7 +390,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
 
           if (properties.compressed_annotated_image_url) {
             hoverTooltipContent += `
-              <img src="${properties.compressed_annotated_image_url}" alt="Annotated Frame Image" style="max-width: 600px; height: auto; border-radius: 4px; margin-top: 5px; object-fit: contain;" />
+              <img src="${properties.compressed_annotated_image_url}" alt="Annotated Frame Image" style="max-width: 400px; height: auto; border-radius: 4px; margin-top: 5px; object-fit: contain;" />
             `;
           } else if (properties.compressed_annotated_image_path_in_zip) {
             hoverTooltipContent += `<p style="margin-top: 5px; color: #aaa;">Image in ZIP</p>`;
@@ -896,21 +897,11 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
                 </h3>
                 
                 <div style={{ fontSize: '0.9em', color: '#666' }}>
-                  <p style={{ margin: '2px 0' }}>
-                    <strong>Distance:</strong> {props?.actual_distance_feet?.toFixed(1) ?? 'N/A'} ft
-                  </p>
-                  <p style={{ margin: '2px 0' }}>
-                    <strong>Speed:</strong> {props?.speed_mph?.toFixed(1) ?? 'N/A'} mph
-                  </p>
+               
                   <p style={{ margin: '2px 0' }}>
                     <strong>Detections:</strong> {props?.detection_count_in_frame ?? 'N/A'}
                   </p>
-                  <p style={{ margin: '2px 0' }}>
-                    <strong>Frame Type:</strong> ${props?.frame_type ?? 'N/A'}
-                  </p>
-                  <p style={{ margin: '2px 0' }}>
-                    <strong>GPS Index:</strong> ${props?.gps_index ?? 'N/A'}
-                  </p>
+                 
                   <p style={{ margin: '2px 0' }}>
                     <strong>Timestamp:</strong> ${props.globalTimestamp ? new Date(props.globalTimestamp).toLocaleString() : 'N/A'}
                   </p>
@@ -953,8 +944,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
                     {props.all_detections_in_frame.map((det: any, detIndex: number) => (
                       <div key={detIndex} className="detection-item">
                         <div><strong>Defect {detIndex + 1}:</strong></div>
-                        <div>Class ID: ${det.class_id ?? 'N/A'}, Confidence: ${det.confidence?.toFixed(2) ?? 'N/A'}</div>
-                        <div>BBox: [${det.bbox ? det.bbox.map((coord: number) => coord.toFixed(0)).join(', ') : 'N/A'}]</div>
+                        <div>Class ID: {crack_types[det.class_id] ?? 'N/A'}, Confidence: {det.confidence?.toFixed(2) ?? 'N/A'}</div>
                       </div>
                     ))}
                   </div>

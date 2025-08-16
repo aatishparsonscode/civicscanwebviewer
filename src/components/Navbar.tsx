@@ -20,15 +20,18 @@ export default function Navbar() {
         <div className="nav-container">
           <Link href="/" className="nav-logo" style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
             CivicScan
+            <span className="beta-label">beta</span>
           </Link>
           
           <div className="nav-links desktop-only">
-            {/* Added style attribute for absolute certainty, though less ideal for maintainability */}
             <Link href="/" className="nav-link" style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
               Home
             </Link>
             <Link href="/map" className="nav-link" style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
               Live Map
+            </Link>
+            <Link href="/waitlist" className="nav-link " style={{ color: '#ffffff', textDecoration: 'none', fontSize:20 }}>
+              Join Waitlist
             </Link>
           </div>
 
@@ -44,7 +47,6 @@ export default function Navbar() {
         </div>
 
         <div className={`mobile-menu ${isMobileMenuOpen ? 'open' : ''}`}>
-          {/* Added style attribute for absolute certainty */}
           <Link href="/" className="mobile-nav-link" onClick={() => setIsMobileMenuOpen(false)} style={{ color: '#ffffff', textDecoration: 'none' }}>
             Home
           </Link>
@@ -54,8 +56,8 @@ export default function Navbar() {
           <Link href="/about" className="mobile-nav-link" onClick={() => setIsMobileMenuOpen(false)} style={{ color: '#ffffff', textDecoration: 'none' }}>
             About
           </Link>
-          <Link href="/contact" className="mobile-nav-link mobile-cta" onClick={() => setIsMobileMenuOpen(false)} style={{ color: '#1a1a1a', textDecoration: 'none' }}>
-            Get Started
+          <Link href="/waitlist" className="mobile-nav-link mobile-cta" onClick={() => setIsMobileMenuOpen(false)} style={{ color: '#ffffff', textDecoration: 'none'  }}>
+            Join Waitlist
           </Link>
         </div>
       </nav>
@@ -99,11 +101,23 @@ export default function Navbar() {
           color: #ffffff;
           text-decoration: none;
           transition: all 0.3s ease;
+          position: relative;
         }
 
         .nav-logo:hover {
           color: #fbbf24;
           transform: translateY(-1px);
+        }
+
+        .beta-label {
+          font-style: italic;
+          font-size: 0.7rem;
+          font-weight: 400;
+          color: #94a3b8;
+          margin-left: 0.3rem;
+          position: relative;
+          top: -0.5rem;
+          opacity: 0.8;
         }
 
         .logo-icon {
@@ -118,7 +132,6 @@ export default function Navbar() {
         }
 
         .nav-link {
-          /* Keep the important for general styling */
           font-weight: 600;
           font-size: 1.1rem;
           padding: 0.5rem 1rem;
@@ -127,7 +140,6 @@ export default function Navbar() {
           position: relative;
         }
 
-        /* Crucially, redefine all states with !important and specific color */
         .nav-link,
         .nav-link:link,
         .nav-link:visited,
@@ -163,12 +175,14 @@ export default function Navbar() {
           color: #1a1a1a !important;
           font-weight: 600;
           box-shadow: 0 4px 12px rgba(251, 191, 36, 0.3);
+          padding: 0.75rem 1.5rem !important;
         }
 
         .nav-cta:hover {
           background: linear-gradient(135deg, #fcd34d 0%, #fbbf24 100%);
           box-shadow: 0 6px 16px rgba(251, 191, 36, 0.4);
           transform: translateY(-2px);
+          color: #1a1a1a !important;
         }
 
         .nav-cta::after {
@@ -229,7 +243,6 @@ export default function Navbar() {
         }
 
         .mobile-nav-link {
-          /* Keep the important for general styling */
           padding: 1rem 1.5rem;
           font-weight: 600;
           font-size: 1.1rem;
@@ -237,7 +250,6 @@ export default function Navbar() {
           border-left: 3px solid transparent;
         }
 
-        /* Crucially, redefine all states with !important and specific color */
         .mobile-nav-link,
         .mobile-nav-link:link,
         .mobile-nav-link:visited,
@@ -255,7 +267,7 @@ export default function Navbar() {
         .mobile-cta {
           margin: 0.5rem 1.5rem;
           background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
-          color: #1a1a1a !important; /* Ensure the CTA text is dark */
+          color: #1a1a1a !important;
           border-radius: 8px;
           font-weight: 600;
           text-align: center;
@@ -264,6 +276,7 @@ export default function Navbar() {
 
         .mobile-cta:hover {
           background: linear-gradient(135deg, #fcd34d 0%, #fbbf24 100%);
+          color: #1a1a1a !important;
         }
 
         @media (max-width: 768px) {
@@ -285,6 +298,11 @@ export default function Navbar() {
 
           .logo-icon {
             font-size: 1.5rem;
+          }
+
+          .beta-label {
+            font-size: 0.6rem;
+            top: -0.4rem;
           }
         }
       `}</style>
