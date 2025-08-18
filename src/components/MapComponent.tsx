@@ -70,7 +70,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
   // Removed internal isSidebarOpen, screenSize states as they are now props
   const [currentZoom, setCurrentZoom] = useState(13);
 
-  // Removed useEffect for screenSize, as sidebarWidth is now a prop from parent
+  
 
   const closeSidebar = () => {
     setSelectedCluster(null);
@@ -332,8 +332,6 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
         let clickPopupContent = `
           <div style="max-width: 330px; font-family: 'Inter', sans-serif;">
             <h3 style="margin: 0 0 10px 0; color: #333; font-size: 1.1em;">Frame Details</h3>
-     
-            <p style="margin: 2px 0;"><strong>Timestamp:</strong> ${properties.globalTimestamp ? new Date(properties.globalTimestamp).toLocaleString() : 'N/A'}</p>
         `;
 
         if (properties.compressed_annotated_image_url) {
@@ -614,6 +612,38 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
     }
   }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen]); // Added setIsSidebarOpen to dependencies
 
+
+  useEffect(() => {
+      // This effect runs only when geojson changes
+      console.log("USE EFFECT RUNNING")
+      if (geojson?.features) {
+          let crackCount = 0;
+          let sealedCrackCount = 0;
+          let potholeCount = 0;
+
+          geojson.features.forEach((feature: any) => {
+              if (feature.properties?.all_detections_in_frame) {
+                  feature.properties.all_detections_in_frame.forEach((detection: any) => {
+                      const defectType = crack_types[detection.class_id];
+                      if (defectType === 'Crack') {
+                          crackCount++;
+                      } else if (defectType === 'Sealed crack') {
+                          sealedCrackCount++;
+                      } else if (defectType === 'Pothole') {
+                          potholeCount++;
+                      }
+                  });
+              }
+          });
+
+          console.log("-------------------------------------");
+          console.log("Defect Counts:");
+          console.log(`Cracks: ${crackCount}`);
+          console.log(`Sealed Cracks: ${sealedCrackCount}`);
+          console.log(`Potholes: ${potholeCount}`);
+          console.log("-------------------------------------");
+      }
+  }, [geojson]);
   return (
     <div style={{ height: '100%', width: '100%', position: 'relative' }}>
       {/* Zoom level indicator */}
@@ -902,9 +932,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
                     <strong>Detections:</strong> {props?.detection_count_in_frame ?? 'N/A'}
                   </p>
                  
-                  <p style={{ margin: '2px 0' }}>
+                  {/* <p style={{ margin: '2px 0' }}>
                     <strong>Timestamp:</strong> ${props.globalTimestamp ? new Date(props.globalTimestamp).toLocaleString() : 'N/A'}
-                  </p>
+                  </p> */}
                 </div>
 
                 {/* Display image if available */}

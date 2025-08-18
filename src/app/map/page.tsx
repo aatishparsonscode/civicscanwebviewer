@@ -19,6 +19,7 @@ export default function MultiS3GeoJSONMapPage() {
   // State for sidebar in parent to control map width
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 }); // Added to dynamically calc sidebar width
+  const [urlLimit, setUrlLimit] = useState(100); // New state for URL limit
 
   useEffect(() => {
     const updateScreenSize = () => {
@@ -70,7 +71,7 @@ export default function MultiS3GeoJSONMapPage() {
           
           // If it's a 404 and we have retries left, wait and try again
           if (response.status === 404 && attempt < maxRetries) {
-            const delay = Math.min(1000 * Math.pow(2, attempt), 4000); // Cap at 4 seconds
+            const delay = Math.min(100 * Math.pow(2, attempt), 400); // Cap at 4 seconds
             console.log(`404 for ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries + 1})`);
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
@@ -94,12 +95,16 @@ export default function MultiS3GeoJSONMapPage() {
     };
 
     try {
-      const geojsonUrls = await listResultsGeojsonUrls();
-      if (geojsonUrls.length === 0) {
+      const allUrls = await listResultsGeojsonUrls();
+      if (allUrls.length === 0) {
         setError('No scan folders found in results_redmond_downtown/.');
         setLoading(false);
         return;
       }
+      
+      // Limit the number of URLs to fetch
+      const geojsonUrls = allUrls.slice(0, urlLimit);
+      console.log(`Fetching data from ${geojsonUrls.length} GeoJSON files.`);
 
       let allFeatures: any[] = [];
       const failedUrls: string[] = [];
@@ -200,6 +205,25 @@ export default function MultiS3GeoJSONMapPage() {
           }}>
             Pavement Defect Map
           </h1>
+          
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <label htmlFor="urlLimit" style={{ fontSize: '0.9rem', color: '#6b7280', fontWeight: '500' }}>Max Segments:</label>
+            <input
+              id="urlLimit"
+              type="number"
+              value={urlLimit}
+              onChange={(e) => setUrlLimit(Number(e.target.value))}
+              min="1"
+              style={{
+                width: '60px',
+                padding: '0.25rem',
+                borderRadius: '4px',
+                border: '1px solid #ccc',
+                fontSize: '0.9rem',
+                textAlign: 'center'
+              }}
+            />
+          </div>
 
           <button
             onClick={handleLoadMap}

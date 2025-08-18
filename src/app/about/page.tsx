@@ -28,7 +28,7 @@ export default function AboutPage() {
               <div className="content-section">
                 <h2 className="section-title">How It Works</h2>
                 <p className="section-text">
-                  Our system processes video feeds and synchronized GPS/accelerometer data to generate detailed GeoJSON reports, 
+                  Our system processes video feeds and synchronized GPS/accelerometer data collected via our mobile app to generate detailed GeoJSON reports, 
                   enabling engineers and urban planners to make informed decisions about road repairs and upkeep. 
                   All you need is a smartphone to start collecting data.
                 </p>
