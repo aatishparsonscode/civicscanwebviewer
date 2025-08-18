@@ -7,7 +7,7 @@ import Navbar from '../components/Navbar'; // Import your Navbar
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Pavement AI',
+  title: 'CivicScan',
   description: 'AI-powered pavement defect detection and mapping',
 };
 
