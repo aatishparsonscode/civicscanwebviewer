@@ -30,6 +30,13 @@ export default function MultiS3GeoJSONMapPage() {
     return () => window.removeEventListener('resize', updateScreenSize);
   }, []);
 
+  useEffect(() => {
+    const loadMap = () => {
+      handleLoadMap()
+    }
+    loadMap();
+  },[])
+
   const getSidebarWidth = () => {
     if (screenSize.width >= 1920) return 1000;
     if (screenSize.width >= 1600) return 800;
