@@ -253,15 +253,17 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
 
         let segmentDetectionCount = 0;
 
-        // Iterate through ALL original features to find detections within this segment's buffer
-        // Note: Here we use the original 'geojson.features' array (not sortedFeatures)
-        // to avoid re-sorting for each segment, but we still check for detection_count_in_frame
         geojson.features.forEach((originalFeature: any) => {
-          if (originalFeature.geometry && originalFeature.geometry.type === 'Point' && originalFeature.properties?.detection_count_in_frame > 0) {
+          if (originalFeature.geometry && originalFeature.geometry.type === 'Point' && originalFeature.properties?.all_detections_in_frame) {
             const detectionPoint = turf.point(originalFeature.geometry.coordinates);
-            // Check if the detection point is within the segment's buffer
             if (turf.booleanPointInPolygon(detectionPoint, segmentBuffer)) {
-              segmentDetectionCount += originalFeature.properties.detection_count_in_frame;
+              // Iterate through the detections in this frame
+              originalFeature.properties.all_detections_in_frame.forEach((det: any) => {
+                // Only count if the class_id is 0 (Crack) or 2 (Pothole)
+                if (det.class_id === 0 || det.class_id === 2) {
+                  segmentDetectionCount += 1; // Count each individual detection
+                }
+              });
             }
           }
         });
