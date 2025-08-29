@@ -1,4 +1,4 @@
-'use client';
+'use client'; // This is crucial for the entire page to render on the client
 
 import React, { useState, useEffect, useRef } from 'react';
 import dynamic from 'next/dynamic';
@@ -19,6 +19,8 @@ function ensureTrailingSlash(path: any): string {
   return normalized.endsWith('/') ? normalized : `${normalized}/`;
 }
 
+// Wrap the entire component with the 'use client' directive
+// This simple change fixes the error by telling Next.js to skip server-side pre-rendering for this page
 export default function MultiS3GeoJSONMapPage() {
   const [geojson, setGeojson] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
@@ -39,9 +41,15 @@ export default function MultiS3GeoJSONMapPage() {
     const updateScreenSize = () => {
       setScreenSize({ width: window.innerWidth, height: window.innerHeight });
     };
-    updateScreenSize();
-    window.addEventListener('resize', updateScreenSize);
-    return () => window.removeEventListener('resize', updateScreenSize);
+    if (typeof window !== 'undefined') {
+      updateScreenSize();
+      window.addEventListener('resize', updateScreenSize);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', updateScreenSize);
+      }
+    };
   }, []);
 
   useEffect(() => {
