@@ -1,6 +1,6 @@
-'use client'; // This is crucial for the entire page to render on the client
+'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
 import dynamic from 'next/dynamic';
 import { useSearchParams } from 'next/navigation';
 
@@ -8,7 +8,6 @@ import { useSearchParams } from 'next/navigation';
 // We'll also pass sidebar state to it
 const DynamicMapComponent = dynamic(() => import('../../components/MapComponent'), {
   ssr: false, // Do not render on server side
-  loading: () => <p className="text-center text-gray-500 text-lg">Loading map...</p>,
 });
 
 function ensureTrailingSlash(path: any): string {
@@ -19,9 +18,7 @@ function ensureTrailingSlash(path: any): string {
   return normalized.endsWith('/') ? normalized : `${normalized}/`;
 }
 
-// Wrap the entire component with the 'use client' directive
-// This simple change fixes the error by telling Next.js to skip server-side pre-rendering for this page
-export default function MultiS3GeoJSONMapPage() {
+function MapContent() {
   const [geojson, setGeojson] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,15 +38,9 @@ export default function MultiS3GeoJSONMapPage() {
     const updateScreenSize = () => {
       setScreenSize({ width: window.innerWidth, height: window.innerHeight });
     };
-    if (typeof window !== 'undefined') {
-      updateScreenSize();
-      window.addEventListener('resize', updateScreenSize);
-    }
-    return () => {
-      if (typeof window !== 'undefined') {
-        window.removeEventListener('resize', updateScreenSize);
-      }
-    };
+    updateScreenSize();
+    window.addEventListener('resize', updateScreenSize);
+    return () => window.removeEventListener('resize', updateScreenSize);
   }, []);
 
   useEffect(() => {
@@ -335,13 +326,15 @@ export default function MultiS3GeoJSONMapPage() {
           transition: 'margin-right 0.3s ease', // Smooth transition for map shrinking/expanding
           marginRight: isSidebarOpen ? `${sidebarWidth}px` : '0', // Pushes map to the left
         }}>
-          {/* Pass sidebar state and width to MapComponent */}
-          <DynamicMapComponent 
-            geojson={geojson} 
-            isSidebarOpen={isSidebarOpen} 
-            setIsSidebarOpen={setIsSidebarOpen} 
-            sidebarWidth={sidebarWidth}
-          />
+          {/* We now use the Suspense boundary here to handle the loading state of the dynamically imported component */}
+          <Suspense fallback={<p className="text-center text-gray-500 text-lg">Loading map...</p>}>
+            <DynamicMapComponent 
+              geojson={geojson} 
+              isSidebarOpen={isSidebarOpen} 
+              setIsSidebarOpen={setIsSidebarOpen} 
+              sidebarWidth={sidebarWidth}
+            />
+          </Suspense>
         </div>
       </div>
 
@@ -388,4 +381,12 @@ export default function MultiS3GeoJSONMapPage() {
       `}</style>
     </>
   );
+}
+
+export default function MultiS3GeoJSONMapPage() {
+  return (
+    <Suspense fallback={<p className="text-center text-gray-500 text-lg">Loading...</p>}>
+      <MapContent />
+    </Suspense>
+  )
 }
