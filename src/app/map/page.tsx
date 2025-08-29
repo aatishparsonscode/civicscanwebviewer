@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import dynamic from 'next/dynamic';
+import { useSearchParams } from 'next/navigation';
 
 // Dynamically import MapComponent to ensure it only loads on the client side
 // We'll also pass sidebar state to it
@@ -9,6 +10,14 @@ const DynamicMapComponent = dynamic(() => import('../../components/MapComponent'
   ssr: false, // Do not render on server side
   loading: () => <p className="text-center text-gray-500 text-lg">Loading map...</p>,
 });
+
+function ensureTrailingSlash(path: any): string {
+  if (path == null) {
+    return "";
+  }
+  const normalized = path.replace(/\\+$/, '/'); // Remove trailing backslashes
+  return normalized.endsWith('/') ? normalized : `${normalized}/`;
+}
 
 export default function MultiS3GeoJSONMapPage() {
   const [geojson, setGeojson] = useState<any | null>(null);
@@ -21,6 +30,11 @@ export default function MultiS3GeoJSONMapPage() {
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 }); // Added to dynamically calc sidebar width
   const [urlLimit, setUrlLimit] = useState(100); // New state for URL limit
 
+  // Use this hook to get the URL search parameters
+  const searchParams = useSearchParams();
+  // Get the 'prefix' parameter from the URL. If it's not there, use the default prefix.
+  const dynamicPrefix = ensureTrailingSlash(searchParams.get('prefix')) || 'results_redmond_downtown/';
+
   useEffect(() => {
     const updateScreenSize = () => {
       setScreenSize({ width: window.innerWidth, height: window.innerHeight });
@@ -32,10 +46,11 @@ export default function MultiS3GeoJSONMapPage() {
 
   useEffect(() => {
     const loadMap = () => {
-      handleLoadMap()
+      // Pass the dynamic prefix to the load handler
+      handleLoadMap(dynamicPrefix);
     }
     loadMap();
-  },[])
+  },[dynamicPrefix]) // The effect now re-runs whenever the prefix changes in the URL
 
   const getSidebarWidth = () => {
     if (screenSize.width >= 1920) return 1000;
@@ -45,11 +60,12 @@ export default function MultiS3GeoJSONMapPage() {
   };
   const sidebarWidth = getSidebarWidth(); // Calculate once per render cycle when screen size changes
 
-  async function listResultsGeojsonUrls(): Promise<string[]> {
-    const prefix = 'results_redmond_downtown/';
+  // This function now accepts the prefix as an argument
+  async function listResultsGeojsonUrls(prefix: string): Promise<string[]> {
     const delimiter = '/';
     const baseUrl = 'https://civicscan-aatishparson-bucket-03-18-2004.s3.amazonaws.com';
 
+    // Use the prefix argument in the API call
     const res = await fetch(`${baseUrl}/?prefix=${prefix}&delimiter=${delimiter}`);
     const xmlText = await res.text();
     const parser = new DOMParser();
@@ -64,7 +80,8 @@ export default function MultiS3GeoJSONMapPage() {
     return prefixes.map(folder => `${baseUrl}/${folder}metadata/results_metadata_grouped.geojson`);
   }
 
-  const handleLoadMap = async () => {
+  // This function now accepts the prefix as an argument
+  const handleLoadMap = async (prefix: string) => {
     setLoading(true);
     setError(null);
     setSuccessMessage(null);
@@ -102,9 +119,10 @@ export default function MultiS3GeoJSONMapPage() {
     };
 
     try {
-      const allUrls = await listResultsGeojsonUrls();
+      // Pass the new prefix to the helper function
+      const allUrls = await listResultsGeojsonUrls(prefix);
       if (allUrls.length === 0) {
-        setError('No scan folders found in results_redmond_downtown/.');
+        setError('No scan folders found in ' + prefix);
         setLoading(false);
         return;
       }
@@ -233,7 +251,8 @@ export default function MultiS3GeoJSONMapPage() {
           </div>
 
           <button
-            onClick={handleLoadMap}
+            // Call handleLoadMap with the current dynamic prefix
+            onClick={() => handleLoadMap(dynamicPrefix)}
             disabled={loading}
             style={{
               background: loading ? '#9ca3af' : '#2563eb',
