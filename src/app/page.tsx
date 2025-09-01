@@ -181,7 +181,12 @@ export default function HomePage() {
       </div>
 
       <div className="footer">
-        © {new Date().getFullYear()} CivicScan. All rights reserved.
+        <p>© {new Date().getFullYear()} CivicScan. All rights reserved.</p>
+          <p className="mt-1">
+            <a href="/privacy" className="text-blue-400 hover:underline">
+              Privacy Policy
+            </a>
+          </p>
       </div>
 
       <style jsx global>{`
