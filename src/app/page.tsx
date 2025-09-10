@@ -148,6 +148,28 @@ export default function HomePage() {
         </div>
       </div>
 
+      {/* Moved video section to new position */}
+      <div className="video-section">
+        <div className="content-wrapper">
+          <div className="section-header scroll-animate" style={{ textAlign: 'center' }}>
+            <h3 className="section-title">AI in the field</h3>
+            <p className="section-description" style={{ maxWidth: '600px', margin: '0 auto' }}>
+              Watch a quick demo of how CivicScan's AI-powered technology automatically detects pavement defects and helps visualize road conditions.
+            </p>
+          </div>
+          <div className="video-container scroll-animate">
+            <iframe
+              src="https://www.youtube.com/embed/Uj-rMoUZ_Zo"
+              title="CivicScan AI-Powered Pavement Intelligence"
+              frameBorder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            ></iframe>
+          </div>
+        </div>
+      </div>
+      {/* End of moved video section */}
+
       <div className="redmond-container">
         <div className="content-wrapper">
           <div className="map-preview-container scroll-animate">
@@ -182,11 +204,11 @@ export default function HomePage() {
 
       <div className="footer">
         <p>© {new Date().getFullYear()} CivicScan. All rights reserved.</p>
-          <p className="mt-1">
-            <a href="/privacy" className="text-blue-400 hover:underline">
-              Privacy Policy
-            </a>
-          </p>
+        <p className="mt-1">
+          <a href="/privacy" className="text-blue-400 hover:underline">
+            Privacy Policy
+          </a>
+        </p>
       </div>
 
       <style jsx global>{`
@@ -248,6 +270,11 @@ export default function HomePage() {
 
         .redmond-container {
           background: linear-gradient(135deg, #2a2a3e 0%, #1e1e2d 100%);
+          padding: 6rem 1.5rem;
+        }
+
+        .video-section {
+          background: linear-gradient(135deg, #1e1e2d 0%, #0f0f23 100%);
           padding: 6rem 1.5rem;
         }
 
@@ -726,6 +753,27 @@ export default function HomePage() {
           transition-delay: 0.6s;
         }
 
+        .video-container {
+          position: relative;
+          width: 100%;
+          padding-top: 56.25%; /* 16:9 Aspect Ratio */
+          margin-top: 2rem;
+          max-width: 800px;
+          margin-left: auto;
+          margin-right: auto;
+          border-radius: 16px;
+          overflow: hidden;
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+
+        .video-container iframe {
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 100%;
+          height: 100%;
+        }
+
         @keyframes bounce {
           0%, 20%, 50%, 80%, 100% {
             transform: translateY(0);
@@ -813,7 +861,7 @@ export default function HomePage() {
             font-size: 1.1rem;
           }
 
-          .ai-detection-container, .redmond-container {
+          .ai-detection-container, .redmond-container, .video-section {
             padding: 4rem 1rem 3rem;
           }
 
