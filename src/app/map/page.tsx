@@ -675,7 +675,7 @@ const buildDefectImageUrls = (images: any = {}) => {
 const convertParentTracksToFeatures = (features: any[]) => {
   const segments: any[] = [];
   const METERS_TO_FEET = 3.28084;
-  const SEGMENT_LENGTH_FEET = 500;
+  const SEGMENT_LENGTH_FEET = 528; // 0.1 mile
 
   const allTracks: any[] = [];
 
