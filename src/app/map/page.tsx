@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from 'react';
 import dynamic from 'next/dynamic';
 import { useSearchParams } from 'next/navigation';
 import * as turf from '@turf/turf';
@@ -1172,7 +1172,7 @@ const buildSegmentCoverageRows = (group: any): SegmentCoverageRowData[] => {
   }).filter((row): row is SegmentCoverageRowData => Boolean(row));
 };
 
-export default function MultiS3GeoJSONMapPage() {
+function MapPageContent() {
   const [geojson, setGeojson] = useState<any | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2139,5 +2139,15 @@ export default function MultiS3GeoJSONMapPage() {
         }
       `}</style>
     </>
+  );
+}
+
+export default function MultiS3GeoJSONMapPage() {
+  return (
+    <Suspense fallback={<div className="flex items-center justify-center h-screen">
+      <p className="text-center text-gray-500 text-lg">Loading...</p>
+    </div>}>
+      <MapPageContent />
+    </Suspense>
   );
 }
