@@ -735,12 +735,33 @@ const MapComponent: React.FC<MapComponentProps> = ({
             const props = feat?.properties || {};
             const damage = props.damage_count ?? 0;
             const tracks = Array.isArray(props.track_ids) ? props.track_ids.join(', ') : 'N/A';
+
+            // Format coordinates for display
+            const startCoord = props.start_coord;
+            const endCoord = props.end_coord;
+            const startLat = Array.isArray(startCoord) && startCoord.length >= 2 ? startCoord[1].toFixed(6) : 'N/A';
+            const startLng = Array.isArray(startCoord) && startCoord.length >= 2 ? startCoord[0].toFixed(6) : 'N/A';
+            const endLat = Array.isArray(endCoord) && endCoord.length >= 2 ? endCoord[1].toFixed(6) : 'N/A';
+            const endLng = Array.isArray(endCoord) && endCoord.length >= 2 ? endCoord[0].toFixed(6) : 'N/A';
+
+            layer.bindTooltip(`
+              <div style="font-family: 'Inter', sans-serif; font-size: 12px;">
+                <strong>Segment</strong><br/>
+                Damage: ${damage}<br/>
+                Start: ${startLat}, ${startLng}<br/>
+                End: ${endLat}, ${endLng}
+              </div>
+            `, { sticky: true });
+
             layer.bindPopup(`
               <div style="font-family: 'Inter', sans-serif;">
                 <strong>Segment</strong><br/>
                 Tracks: ${tracks}<br/>
                 Damage: ${damage}<br/>
-                Defect types: ${Array.isArray(props.defect_types) && props.defect_types.length > 0 ? props.defect_types.join(', ') : 'N/A'}
+                Defect types: ${Array.isArray(props.defect_types) && props.defect_types.length > 0 ? props.defect_types.join(', ') : 'N/A'}<br/>
+                <br/>
+                <strong>Start:</strong> ${startLat}, ${startLng}<br/>
+                <strong>End:</strong> ${endLat}, ${endLng}
               </div>
             `);
             layer.on('click', () => {
