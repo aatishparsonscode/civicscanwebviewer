@@ -23,12 +23,6 @@ import * as EsriLeaflet from 'esri-leaflet';
 // Import Turf.js modules
 import * as turf from '@turf/turf';
 
-const crack_types = {
-  0: "Crack",
-  1 : "Sealed crack",
-  2 : "Pothole"
-}
-
 // FIX: This is a common workaround for Leaflet's default icon paths in bundlers like Webpack/Next.js
 // Without this, default markers might appear as broken images.
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -43,6 +37,7 @@ interface MapComponentProps {
   isSidebarOpen: boolean; // Prop from parent
   setIsSidebarOpen: (isOpen: boolean) => void; // Prop from parent
   sidebarWidth: number; // Prop from parent
+  onSegmentSelected?: (segment: any | null) => void;
 }
 
 interface ClusterData {
@@ -61,20 +56,197 @@ const ZOOM_THRESHOLDS = {
   INDIVIDUAL_MARKERS: 19 // Individual markers only at zoom 16 and above
 };
 
-const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, setIsSidebarOpen, sidebarWidth }) => {
+const MapComponent: React.FC<MapComponentProps> = ({
+  geojson,
+  isSidebarOpen,
+  setIsSidebarOpen,
+  sidebarWidth,
+  onSegmentSelected,
+}) => {
   const mapRef = useRef<L.Map>(null);
   const clusterGroupRef = useRef<L.MarkerClusterGroup | null>(null);
   const pathDensityLayerRef = useRef<L.GeoJSON | null>(null);
+  const crackLinesLayerRef = useRef<L.GeoJSON | null>(null);
   const individualMarkersLayerRef = useRef<L.LayerGroup | null>(null);
   const [selectedCluster, setSelectedCluster] = useState<ClusterData | null>(null);
+  const [selectedTrackGroup, setSelectedTrackGroup] = useState<any | null>(null);
+  const [segmentModalOpen, setSegmentModalOpen] = useState(false);
+  const [hoveredThumbnail, setHoveredThumbnail] = useState<string | null>(null);
+  const [hoveredSegmentInfo, setHoveredSegmentInfo] = useState<any | null>(null);
+
+  const openSegmentPage = (group: any) => {
+    if (typeof window === 'undefined' || !group) return;
+    const tracks = Array.isArray(group.overlapping_tracks) ? group.overlapping_tracks : [];
+    if (tracks.length === 0) return;
+
+    const segmentStart = Number(group.start_feet) || 0;
+    const inferredEnd = tracks.reduce((max: number, t: any) => Math.max(max, Number(t.end_feet) || 0), 0);
+    const segmentEnd = Number.isFinite(Number(group.end_feet)) ? Number(group.end_feet) : inferredEnd;
+    const maxEnd = Math.max(1, segmentEnd - segmentStart);
+    const grouped = tracks.reduce((acc: any[], t: any) => {
+      const parentId = t.parent_track_id ?? t.track_id ?? `track-${acc.length}`;
+      let existing = acc.find((g: any) => g.parent_track_id === parentId);
+      if (!existing) {
+        existing = { parent_track_id: parentId, spans: [] as any[] };
+        acc.push(existing);
+      }
+      existing.spans.push({
+        start_feet: Number(t.start_feet) || 0,
+        end_feet: Number(t.end_feet) || 0,
+        thumbnail_url: t.thumbnail_url,
+        track_damage: t.track_damage,
+        track_id: t.track_id,
+        defect_types: t.defect_types,
+        severity_labels: t.severity_labels,
+      });
+      return acc;
+    }, []);
+
+    const rowsHtml = grouped.map((g, idx) => {
+      const spans = g.spans.sort((a: any, b: any) => a.start_feet - b.start_feet);
+      const rowStart = Math.min(...spans.map((s: any) => Math.max(0, Math.min(segmentEnd, s.start_feet) - segmentStart)));
+      const rowEnd = Math.max(...spans.map((s: any) => Math.max(0, Math.min(segmentEnd, s.end_feet) - segmentStart)));
+      const rowLength = Math.max(0, rowEnd - rowStart);
+      const defectSet = new Set<string>();
+      spans.forEach((s: any) => {
+        (Array.isArray(s.defect_types) ? s.defect_types : []).forEach((dt: any) => {
+          if (dt) defectSet.add(String(dt));
+        });
+      });
+      const defectLabel = defectSet.size ? Array.from(defectSet).join(', ') : 'unknown';
+      const overlapStart = Math.max(0, Math.min(segmentEnd, Math.min(...spans.map((s: any) => s.start_feet))) - segmentStart);
+      const overlapEnd = Math.max(0, Math.min(segmentEnd, Math.max(...spans.map((s: any) => s.end_feet))) - segmentStart);
+      const filledLeft = (overlapStart / maxEnd) * 100;
+      const filledWidth = Math.max(2, ((overlapEnd - overlapStart) / maxEnd) * 100);
+      const dotsHtml = spans
+        .map((s: any) => {
+          if (!s.thumbnail_url && !s.track_id) return null;
+          const clampStart = Math.max(segmentStart, s.start_feet);
+          const clampEnd = Math.min(segmentEnd, s.end_feet);
+          const mid = ((clampStart + clampEnd) / 2) - segmentStart;
+          const pos = (mid / maxEnd) * 100;
+          if (!Number.isFinite(pos)) return null;
+          const damageType = Array.isArray(s.defect_types) && s.defect_types.length > 0 ? s.defect_types.join(', ') : 'unknown';
+          const title = `Track ${s.track_id ?? 'n/a'}: ${damageType}`;
+          return `<div class="dot" style="left:${pos}%;" title="${title}"></div>`;
+        })
+        .filter(Boolean)
+        .join('');
+      const barHtml = `
+        <div class="base"></div>
+        <div class="bar" style="left:${filledLeft}%;width:${filledWidth}%;" title="Parent coverage"></div>
+        ${dotsHtml}
+      `;
+
+      const thumbs = spans
+        .map((s: any) => s.thumbnail_url)
+        .filter((u: any) => typeof u === 'string' && u.trim())
+        .map((u: string, ti: number) => {
+          const span = spans[ti] || {};
+          const damageType = Array.isArray(span.defect_types) && span.defect_types.length > 0 ? span.defect_types.join(', ') : 'unknown';
+          const severityLabel = Array.isArray(span.severity_labels) && span.severity_labels.length > 0 ? span.severity_labels.join(', ') : 'unknown';
+          const clampStart = Math.max(segmentStart, span.start_feet || 0);
+          const clampEnd = Math.min(segmentEnd, span.end_feet || 0);
+          const lengthFt = span.measured_length_feet ?? (Number.isFinite(clampStart) && Number.isFinite(clampEnd) ? Math.max(0, clampEnd - clampStart) : null);
+          const lengthLabel = lengthFt ? `${lengthFt.toFixed(1)}ft` : 'N/A';
+          return `<div class="thumb-card"><img src="${u}" alt="thumb-${ti}" class="thumb-full" /><div class="thumb-caption">Defects: ${damageType} · Severity: ${severityLabel} · Length: ${lengthLabel}</div></div>`;
+        })
+        .join('');
+
+      return `
+        <div class="row">
+          <div class="row-left">
+            <div class="row-label">Defects: ${defectLabel} · ${rowLength.toFixed(1)}ft (${rowStart.toFixed(1)}ft - ${rowEnd.toFixed(1)}ft)</div>
+            <div class="row-bar">${barHtml}</div>
+          </div>
+          <div class="row-right">
+            ${thumbs || '<div class="thumb-caption">No images available</div>'}
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    const html = `
+      <html>
+        <head>
+          <title>Segment Coverage</title>
+          <style>
+            body { font-family: Inter, Arial, sans-serif; padding: 20px; background: #f9fafb; color: #111827; }
+            .header { margin-bottom: 16px; }
+            .row { display: flex; gap: 16px; align-items: flex-start; margin-bottom: 18px; }
+            .row-left { flex: 1 1 45%; min-width: 280px; }
+            .row-right { flex: 1 1 45%; min-width: 320px; display: flex; flex-direction: column; gap: 12px; }
+            .row-label { font-size: 14px; margin-bottom: 6px; color: #374151; }
+            .row-bar { position: relative; height: 18px; background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+            .base { position: absolute; top: 0; bottom: 0; left: 0; right: 0; background: #e5e7eb; }
+            .bar { position: absolute; top: 0; bottom: 0; background: #2563eb; opacity: 0.9; border-radius: 8px; }
+            .dot { position: absolute; top: 50%; width: 10px; height: 10px; margin-top: -5px; border-radius: 50%; background: #ff7f0e; border: 1px solid #ffffff; box-shadow: 0 0 4px rgba(0,0,0,0.3); }
+            .summary { margin-top: 16px; font-size: 14px; color: #4b5563; }
+            .thumbs { display: flex; flex-direction: column; gap: 12px; }
+            .thumb-card { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+            .thumb-full { width: 100%; aspect-ratio: 16 / 9; border-radius: 8px; border: 1px solid #e5e7eb; object-fit: cover; object-position: center; box-shadow: 0 4px 10px rgba(0,0,0,0.08); }
+            .thumb-caption { font-size: 13px; color: #1f2937; max-width: 100%; }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <h2 style="margin:0;">Segment Coverage</h2>
+            <div class="summary">
+              Tracks: ${Array.isArray(group.track_ids) ? group.track_ids.join(', ') : 'N/A'} |
+              Damage: ${group.damage_count ?? 'N/A'} |
+              Range: ${group.start_feet?.toFixed ? group.start_feet.toFixed(1) : 'N/A'}ft - ${group.end_feet?.toFixed ? group.end_feet.toFixed(1) : 'N/A'}ft
+            </div>
+          </div>
+          ${rowsHtml}
+        </body>
+      </html>
+    `;
+
+    const w = window.open('', '_blank');
+    if (w) {
+      w.document.write(html);
+      w.document.close();
+    }
+  };
+  const [expandedDetectionFrames, setExpandedDetectionFrames] = useState<Set<string>>(() => new Set());
   // Removed internal isSidebarOpen, screenSize states as they are now props
   const [currentZoom, setCurrentZoom] = useState(13);
+  const sortedSidebarFrames = useMemo(() => {
+    if (!selectedCluster?.markers) {
+      return [];
+    }
+    return [...selectedCluster.markers].sort((a: any, b: any) => {
+      const frameA = Number(a?.properties?.frame_number ?? a?.properties?.frame_id ?? Number.MAX_SAFE_INTEGER);
+      const frameB = Number(b?.properties?.frame_number ?? b?.properties?.frame_id ?? Number.MAX_SAFE_INTEGER);
+      if (!Number.isFinite(frameA) && !Number.isFinite(frameB)) return 0;
+      if (!Number.isFinite(frameA)) return 1;
+      if (!Number.isFinite(frameB)) return -1;
+      return frameA - frameB;
+    });
+  }, [selectedCluster]);
 
-  
+  // Removed useEffect for screenSize, as sidebarWidth is now a prop from parent
 
   const closeSidebar = () => {
     setSelectedCluster(null);
+    setSelectedTrackGroup(null);
+    setSegmentModalOpen(false);
     setIsSidebarOpen(false); // Update parent state
+    if (typeof onSegmentSelected === 'function') {
+      onSegmentSelected(null);
+    }
+  };
+
+  const toggleDetectionGrid = (frameKey: string) => {
+    setExpandedDetectionFrames(prev => {
+      const next = new Set(prev);
+      if (next.has(frameKey)) {
+        next.delete(frameKey);
+      } else {
+        next.add(frameKey);
+      }
+      return next;
+    });
   };
 
   // Removed getSidebarWidth as it's now passed as a prop
@@ -115,6 +287,50 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
     return 4;
   };
 
+  const damagePercentiles = useMemo(() => {
+    const values: number[] = [];
+    if (geojson?.features) {
+      geojson.features.forEach((f: any) => {
+        const damage = Number(f?.properties?.damage_count);
+        if (Number.isFinite(damage)) {
+          values.push(damage);
+        }
+      });
+    }
+    if (values.length === 0) {
+      return { p50: 0, p75: 0, p90: 0, p95: 0, max: 0 };
+    }
+    const sorted = values.sort((a, b) => a - b);
+    const quantile = (q: number) => {
+      if (sorted.length === 0) return 0;
+      const pos = (sorted.length - 1) * q;
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      if (sorted[base + 1] !== undefined) {
+        return sorted[base] + rest * (sorted[base + 1] - sorted[base]);
+      }
+      return sorted[base];
+    };
+    return {
+      p50: quantile(0.5),
+      p75: quantile(0.75),
+      p90: quantile(0.9),
+      p95: quantile(0.95),
+      max: sorted[sorted.length - 1],
+    };
+  }, [geojson]);
+
+  const getTrackColor = (feature: any) => {
+    const damageCount = Number(feature?.properties?.damage_count ?? 0);
+    if (!Number.isFinite(damageCount) || damageCount <= 0) return '#16a34a'; // green
+    const { p50, p75, p90, p95 } = damagePercentiles;
+    if (damageCount <= p50) return '#65a30d'; // yellow-green
+    if (damageCount <= p75) return '#facc15'; // yellow
+    if (damageCount <= p90) return '#f97316'; // orange
+    if (damageCount <= p95) return '#ea580c'; // orange-red
+    return '#b91c1c'; // darkest red (top ~5%)
+  };
+
   // Function to interpolate color for a gradient (NO LONGER USED WITH PERCENTILES, BUT KEPT FOR REFERENCE)
   const interpolateColor = (value: number, min: number, max: number, color1: string, color2: string) => {
     const hexToRgb = (hex: string) => {
@@ -149,6 +365,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
     if (pathDensityLayerRef.current && map.hasLayer(pathDensityLayerRef.current)) {
       map.removeLayer(pathDensityLayerRef.current);
     }
+    if (crackLinesLayerRef.current && map.hasLayer(crackLinesLayerRef.current)) {
+      map.removeLayer(crackLinesLayerRef.current);
+    }
     if (clusterGroupRef.current && map.hasLayer(clusterGroupRef.current)) {
       map.removeLayer(clusterGroupRef.current);
     }
@@ -159,6 +378,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
     // Add layers based on zoom level
     if (zoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS) {
       // Highest zoom: only individual markers
+      if (crackLinesLayerRef.current) {
+        map.addLayer(crackLinesLayerRef.current);
+      }
       if (individualMarkersLayerRef.current) {
         map.addLayer(individualMarkersLayerRef.current);
       }
@@ -167,11 +389,17 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
       if (pathDensityLayerRef.current) {
         map.addLayer(pathDensityLayerRef.current);
       }
+      if (crackLinesLayerRef.current) {
+        map.addLayer(crackLinesLayerRef.current);
+      }
       if (clusterGroupRef.current) {
         map.addLayer(clusterGroupRef.current);
       }
     } else if (zoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE) {
       // Low-medium zoom: only paths
+      if (crackLinesLayerRef.current) {
+        map.addLayer(crackLinesLayerRef.current);
+      }
       if (pathDensityLayerRef.current) {
         map.addLayer(pathDensityLayerRef.current);
       }
@@ -253,17 +481,15 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
 
         let segmentDetectionCount = 0;
 
+        // Iterate through ALL original features to find detections within this segment's buffer
+        // Note: Here we use the original 'geojson.features' array (not sortedFeatures)
+        // to avoid re-sorting for each segment, but we still check for detection_count_in_frame
         geojson.features.forEach((originalFeature: any) => {
-          if (originalFeature.geometry && originalFeature.geometry.type === 'Point' && originalFeature.properties?.all_detections_in_frame) {
+          if (originalFeature.geometry && originalFeature.geometry.type === 'Point' && originalFeature.properties?.detection_count_in_frame > 0) {
             const detectionPoint = turf.point(originalFeature.geometry.coordinates);
+            // Check if the detection point is within the segment's buffer
             if (turf.booleanPointInPolygon(detectionPoint, segmentBuffer)) {
-              // Iterate through the detections in this frame
-              originalFeature.properties.all_detections_in_frame.forEach((det: any) => {
-                // Only count if the class_id is 0 (Crack) or 2 (Pothole)
-                if (det.class_id === 0 || det.class_id === 2) {
-                  segmentDetectionCount += 1; // Count each individual detection
-                }
-              });
+              segmentDetectionCount += originalFeature.properties.detection_count_in_frame;
             }
           }
         });
@@ -334,6 +560,12 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
         let clickPopupContent = `
           <div style="max-width: 330px; font-family: 'Inter', sans-serif;">
             <h3 style="margin: 0 0 10px 0; color: #333; font-size: 1.1em;">Frame Details</h3>
+            <p style="margin: 2px 0;"><strong>Distance:</strong> ${properties.actual_distance_feet?.toFixed(1) ?? 'N/A'} ft</p>
+            <p style="2px 0;"><strong>Speed:</strong> ${properties.speed_mph?.toFixed(1) ?? 'N/A'} mph</p>
+            <p style="margin: 2px 0;"><strong>Frame Type:</strong> ${properties.frame_type ?? 'N/A'}</p>
+            <p style="margin: 2px 0;"><strong>Frame #:</strong> ${properties.frame_number ?? 'N/A'}</p>
+            <p style="margin: 2px 0;"><strong>GPS Index:</strong> ${properties.gps_index ?? 'N/A'}</p>
+            <p style="margin: 2px 0;"><strong>Timestamp:</strong> ${properties.globalTimestamp ? new Date(properties.globalTimestamp).toLocaleString() : 'N/A'}</p>
         `;
 
         if (properties.compressed_annotated_image_url) {
@@ -365,9 +597,10 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
           properties.all_detections_in_frame.forEach((det: any, index: number) => {
             clickPopupContent += `
               <li style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: ${index < properties.all_detections_in_frame.length - 1 ? '1px dashed #ddd' : 'none'};">
-                <p style="margin: 0;"><strong>Defect type: ${crack_types[det.class_id]}</strong></p>
-                <p style="margin: 0 0 2px 10px; font-size: 0.9em;">Confidence: ${det.confidence?.toFixed(2) ?? 'N/A'}</p>
-               
+                <p style="margin: 0;"><strong>Defect ${index + 1}:</strong></p>
+                <p style="margin: 0 0 2px 10px; font-size: 0.9em;">Class ID: ${det.class_id ?? 'N/A'}, Confidence: ${det.confidence?.toFixed(2) ?? 'N/A'}</p>
+                <p style="margin: 0 0 0 10px; font-size: 0.9em;">BBox: [${det.bbox ? det.bbox.map((coord: number) => coord.toFixed(0)).join(', ') : 'N/A'}]</p>
+              </li>
             `;
           });
           clickPopupContent += `
@@ -390,7 +623,7 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
 
           if (properties.compressed_annotated_image_url) {
             hoverTooltipContent += `
-              <img src="${properties.compressed_annotated_image_url}" alt="Annotated Frame Image" style="max-width: 400px; height: auto; border-radius: 4px; margin-top: 5px; object-fit: contain;" />
+              <img src="${properties.compressed_annotated_image_url}" alt="Annotated Frame Image" style="max-width: 600px; height: auto; border-radius: 4px; margin-top: 5px; object-fit: contain;" />
             `;
           } else if (properties.compressed_annotated_image_path_in_zip) {
             hoverTooltipContent += `<p style="margin-top: 5px; color: #aaa;">Image in ZIP</p>`;
@@ -438,6 +671,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
       if (pathDensityLayerRef.current) {
         mapRef.current.removeLayer(pathDensityLayerRef.current);
       }
+      if (crackLinesLayerRef.current) {
+        mapRef.current.removeLayer(crackLinesLayerRef.current);
+      }
       if (individualMarkersLayerRef.current) {
         mapRef.current.removeLayer(individualMarkersLayerRef.current);
       }
@@ -480,6 +716,55 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
           }
         });
         pathDensityLayerRef.current = pathLayer;
+      }
+
+      // Parent track crack grid/segments (LineString or Polygon)
+      const crackFeatures = geojson?.features
+        ?.filter((f: any) => f.geometry?.type === 'LineString' || f.geometry?.type === 'Polygon') || [];
+
+      if (crackFeatures.length > 0) {
+        const crackLayer = L.geoJSON(crackFeatures as any, {
+          style: (feat: any) => ({
+            color: getTrackColor(feat),
+            weight: feat.geometry?.type === 'Polygon' ? 1.5 : 6,
+            opacity: 0.85,
+            fillColor: getTrackColor(feat),
+            fillOpacity: feat.geometry?.type === 'Polygon' ? 0.35 : 0,
+          }),
+          onEachFeature: (feat: any, layer: any) => {
+            const props = feat?.properties || {};
+            const damage = props.damage_count ?? 0;
+            const tracks = Array.isArray(props.track_ids) ? props.track_ids.join(', ') : 'N/A';
+            layer.bindPopup(`
+              <div style="font-family: 'Inter', sans-serif;">
+                <strong>Segment</strong><br/>
+                Tracks: ${tracks}<br/>
+                Damage: ${damage}<br/>
+                Defect types: ${Array.isArray(props.defect_types) && props.defect_types.length > 0 ? props.defect_types.join(', ') : 'N/A'}
+              </div>
+            `);
+            layer.on('click', () => {
+              const payload = {
+                damage_count: damage,
+                track_ids: props.track_ids || [],
+                defect_type: props.defect_type || 'Aggregated',
+                overlapping_tracks: props.overlapping_tracks || [],
+                start_coord: props.start_coord,
+                end_coord: props.end_coord,
+                start_feet: props.start_feet,
+                end_feet: props.end_feet,
+                job_ids: props.job_ids || [],
+              };
+              setSelectedTrackGroup(payload);
+              if (typeof onSegmentSelected === 'function') {
+                onSegmentSelected(payload);
+              }
+            });
+          }
+        });
+        crackLinesLayerRef.current = crackLayer;
+      } else {
+        crackLinesLayerRef.current = null;
       }
 
       // Create cluster group
@@ -534,6 +819,10 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
         };
 
         setSelectedCluster(clusterData);
+        setSelectedTrackGroup(null);
+        if (typeof onSegmentSelected === 'function') {
+          onSegmentSelected(null);
+        }
         setIsSidebarOpen(true); // Update parent state
         L.DomEvent.stopPropagation(event.originalEvent);
       });
@@ -585,6 +874,9 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
       if (pathDensityLayerRef.current) {
         allLayers.push(pathDensityLayerRef.current);
       }
+      if (crackLinesLayerRef.current) {
+        allLayers.push(crackLinesLayerRef.current);
+      }
 
       if (allLayers.length > 0) {
         const combinedGroup = new L.featureGroup(allLayers);
@@ -606,46 +898,19 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
         mapRef.current.removeLayer(pathDensityLayerRef.current);
         pathDensityLayerRef.current = null;
       }
+      if (crackLinesLayerRef.current) {
+        mapRef.current.removeLayer(crackLinesLayerRef.current);
+        crackLinesLayerRef.current = null;
+      }
       if (individualMarkersLayerRef.current) {
         mapRef.current.removeLayer(individualMarkersLayerRef.current);
         individualMarkersLayerRef.current = null;
       }
       mapRef.current.setView([47.6, -122.3], 13);
     }
-  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen]); // Added setIsSidebarOpen to dependencies
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected]); // Added setIsSidebarOpen to dependencies
 
-
-  useEffect(() => {
-      // This effect runs only when geojson changes
-      console.log("USE EFFECT RUNNING")
-      if (geojson?.features) {
-          let crackCount = 0;
-          let sealedCrackCount = 0;
-          let potholeCount = 0;
-
-          geojson.features.forEach((feature: any) => {
-              if (feature.properties?.all_detections_in_frame) {
-                  feature.properties.all_detections_in_frame.forEach((detection: any) => {
-                      const defectType = crack_types[detection.class_id];
-                      if (defectType === 'Crack') {
-                          crackCount++;
-                      } else if (defectType === 'Sealed crack') {
-                          sealedCrackCount++;
-                      } else if (defectType === 'Pothole') {
-                          potholeCount++;
-                      }
-                  });
-              }
-          });
-
-          console.log("-------------------------------------");
-          console.log("Defect Counts:");
-          console.log(`Cracks: ${crackCount}`);
-          console.log(`Sealed Cracks: ${sealedCrackCount}`);
-          console.log(`Potholes: ${potholeCount}`);
-          console.log("-------------------------------------");
-      }
-  }, [geojson]);
   return (
     <div style={{ height: '100%', width: '100%', position: 'relative' }}>
       {/* Zoom level indicator */}
@@ -837,24 +1102,125 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
           background: #cc0000;
         }
 
-        .detection-list {
-          background: white;
-          border: 1px solid #ddd;
-          border-radius: 6px;
+        .detection-row-wrapper {
+          margin-top: 16px;
+          border: 1px dashed #e5e7eb;
+          border-radius: 10px;
           padding: 12px;
-          margin-top: 12px;
-          max-height: 200px;
-          overflow-y: auto;
+          background: #f9fafb;
+          position: relative;
+          overflow: visible;
+          transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
 
-        .detection-item {
-          padding: 8px 0;
-          border-bottom: 1px dashed #eee;
-          font-size: 0.9em;
+        .detection-row-wrapper.expanded {
+          border-color: #a5b4fc;
+          box-shadow: 0 8px 20px rgba(99, 102, 241, 0.1);
         }
 
-        .detection-item:last-child {
-          border-bottom: none;
+        .detection-row-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          font-size: 0.85em;
+          color: #4b5563;
+          margin-bottom: 8px;
+        }
+
+        .detection-preview-row {
+          display: flex;
+          gap: 8px;
+          overflow-x: auto;
+          padding-bottom: 4px;
+          cursor: pointer;
+        }
+
+        .detection-thumb {
+          width: 56px;
+          height: 56px;
+          border-radius: 8px;
+          border: 1px solid #d1d5db;
+          background: linear-gradient(145deg, #fff, #e5e7eb);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 0.7em;
+          font-weight: 600;
+          color: #374151;
+          box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4);
+          flex-shrink: 0;
+        }
+
+        .detection-thumb img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          border-radius: 8px;
+        }
+
+        .detection-grid-popup {
+          display: none;
+          position: absolute;
+          top: 100%;
+          left: 0;
+          width: min(420px, calc(100vw - 80px));
+          background: white;
+          border: 1px solid #d1d5db;
+          border-radius: 12px;
+          padding: 16px;
+          box-shadow: 0 15px 35px rgba(0,0,0,0.18);
+          margin-top: 10px;
+          z-index: 20;
+        }
+
+        .detection-row-wrapper.expanded .detection-grid-popup {
+          display: block;
+        }
+
+        .detection-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+          gap: 12px;
+        }
+
+        .detection-grid-item {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          font-size: 0.8em;
+          color: #1f2937;
+        }
+
+        .detection-grid-item img {
+          width: 100%;
+          height: 100px;
+          object-fit: cover;
+          border-radius: 8px;
+          border: 1px solid #e5e7eb;
+        }
+
+        .detection-grid-meta {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+
+        .detection-toggle-btn {
+          border: none;
+          background: #e0e7ff;
+          color: #3730a3;
+          padding: 4px 10px;
+          border-radius: 999px;
+          font-size: 0.75em;
+          font-weight: 600;
+          transition: background 0.2s ease, color 0.2s ease;
+          cursor: pointer;
+          margin-left: 8px;
+        }
+
+        .detection-toggle-btn:hover {
+          background: #c7d2fe;
+          color: #312e81;
         }
 
         /* Overlay to darken background when sidebar is open */
@@ -892,17 +1258,181 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
       
       {/* Sidebar overlay */}
       <div className="sidebar-overlay" onClick={closeSidebar}></div>
+
+      {/* Segment modal */}
+      {segmentModalOpen && selectedTrackGroup && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0,0,0,0.4)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 20000,
+          paddingTop: '60px',
+        }}
+        onClick={() => setSegmentModalOpen(false)}
+        >
+          <div style={{
+            background: 'white',
+            borderRadius: '12px',
+            padding: '20px',
+            width: '600px',
+            maxWidth: '90vw',
+            maxHeight: '80vh',
+            overflowY: 'auto',
+            boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+            position: 'relative',
+          }}
+          onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ margin: 0 }}>Segment Coverage</h3>
+              <button className="close-btn" onClick={() => setSegmentModalOpen(false)}>Close</button>
+            </div>
+            {Array.isArray(selectedTrackGroup.overlapping_tracks) && selectedTrackGroup.overlapping_tracks.length > 0 ? (
+              (() => {
+                const maxEnd = selectedTrackGroup.overlapping_tracks.reduce((max: number, t: any) => Math.max(max, Number(t.end_feet) || 0), 0) || 1;
+                return (
+                  <div>
+                    <div style={{ marginBottom: 8, color: '#555', fontSize: '0.9em' }}>
+                      X-axis: feet along combined path · Y-axis: parent/track IDs
+                    </div>
+                    <div style={{ border: '1px solid #e5e7eb', padding: '12px', borderRadius: '8px', position: 'relative' }}>
+                      {hoveredThumbnail && (
+                        <div style={{
+                          position: 'absolute',
+                          top: '-10px',
+                          right: '-10px',
+                          background: 'white',
+                          border: '1px solid #d1d5db',
+                          borderRadius: '8px',
+                          padding: '6px',
+                          boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+                          zIndex: 10,
+                        }}>
+                          <img src={hoveredThumbnail} alt="thumbnail" style={{ maxWidth: '280px', maxHeight: '220px', objectFit: 'contain', borderRadius: '6px' }} />
+                        </div>
+                      )}
+                      {(() => {
+                        const grouped = (selectedTrackGroup.overlapping_tracks || []).reduce((acc: any[], t: any) => {
+                          const parentId = t.parent_track_id ?? t.track_id ?? `track-${acc.length}`;
+                          let existing = acc.find((g: any) => g.parent_track_id === parentId);
+                          if (!existing) {
+                            existing = { parent_track_id: parentId, spans: [] as any[] };
+                            acc.push(existing);
+                          }
+                          existing.spans.push({
+                            start_feet: Number(t.start_feet) || 0,
+                            end_feet: Number(t.end_feet) || 0,
+                            thumbnail_url: t.thumbnail_url,
+                            track_damage: t.track_damage,
+                            track_id: t.track_id,
+                            defect_types: t.defect_types,
+                          });
+                          return acc;
+                        }, []);
+
+                        return grouped.map((group: any, idx: number) => {
+                          const spans = group.spans.sort((a: any, b: any) => a.start_feet - b.start_feet);
+                          const groupStart = Math.min(...spans.map((s: any) => s.start_feet));
+                          const groupEnd = Math.max(...spans.map((s: any) => s.end_feet));
+                          const label = group.parent_track_id ?? `track-${idx}`;
+                          let lastDrawnEnd = groupStart;
+                          return (
+                            <div key={idx} style={{ marginBottom: 12 }}>
+                              <div style={{ fontSize: '0.9em', marginBottom: 4, color: '#374151' }}>
+                                {label} ({groupStart.toFixed(1)}ft - {groupEnd.toFixed(1)}ft)
+                              </div>
+                              <div style={{ position: 'relative', height: '18px', background: '#f3f4f6', borderRadius: '8px' }}>
+                                {spans.map((s: any, spanIdx: number) => {
+                                  const rawStart = s.start_feet;
+                                  const rawEnd = s.end_feet;
+                                  const adjStart = Math.max(rawStart, lastDrawnEnd);
+                                  const adjEnd = Math.max(adjStart + 0.01, rawEnd); // ensure positive width
+                                  const widthPct = Math.max(2, ((adjEnd - adjStart) / maxEnd) * 100);
+                                  const leftPct = (adjStart / maxEnd) * 100;
+                                  lastDrawnEnd = adjEnd;
+                                  return (
+                                    <div
+                                      key={spanIdx}
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPct}%`,
+                                        width: `${widthPct}%`,
+                                        top: 0,
+                                        bottom: 0,
+                                        background: '#2563eb',
+                                        borderRadius: '8px',
+                                        opacity: 0.9,
+                                      }}
+                                      onMouseEnter={() => {
+                                        if (s.thumbnail_url) setHoveredThumbnail(s.thumbnail_url);
+                                        const damageType = Array.isArray(s.defect_types) && s.defect_types.length > 0
+                                          ? s.defect_types.join(', ')
+                                          : 'unknown';
+                                        setHoveredSegmentInfo({
+                                          label: label,
+                                          range: `${adjStart.toFixed(1)}ft - ${adjEnd.toFixed(1)}ft`,
+                                          damage: s.track_damage,
+                                          trackId: s.track_id,
+                                          damageType,
+                                        });
+                                      }}
+                                      onMouseLeave={() => {
+                                        setHoveredThumbnail(null);
+                                        setHoveredSegmentInfo(null);
+                                      }}
+                                    />
+                                  );
+                                })}
+                              </div>
+                              {hoveredSegmentInfo && hoveredSegmentInfo.label === label && (
+                                <div style={{ marginTop: 6, fontSize: '0.85em', color: '#374151' }}>
+                                  Defect {hoveredSegmentInfo.trackId ?? label}: {hoveredSegmentInfo.damageType ?? 'unknown'} ({hoveredSegmentInfo.range}) · Damage: {hoveredSegmentInfo.damage ?? 'N/A'}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        });
+                      })()}
+                    </div>
+                  </div>
+                );
+              })()
+            ) : (
+              <div style={{ color: '#6b7280' }}>No track coverage data for this segment.</div>
+            )}
+          </div>
+        </div>
+      )}
       
       {/* Sidebar */}
-      <div className="sidebar">
-        <div className="sidebar-header">
-          <h2 style={{ margin: '0 0 10px 0', fontSize: '1.3em', color: '#333' }}>
-            Cluster Details
-          </h2>
+          <div className="sidebar">
+            <div className="sidebar-header">
+              <h2 style={{ margin: '0 0 10px 0', fontSize: '1.3em', color: '#333' }}>
+                {selectedTrackGroup ? 'Track Details' : 'Cluster Details'}
+              </h2>
           <button className="close-btn" onClick={closeSidebar}>
             Close
           </button>
-          {selectedCluster && (
+          {selectedTrackGroup && (
+            <div style={{ clear: 'both', marginTop: '16px' }}>
+              <p style={{ margin: '4px 0', fontSize: '0.95em' }}>
+                <strong>Tracks:</strong> {Array.isArray(selectedTrackGroup.track_ids) ? selectedTrackGroup.track_ids.join(', ') : 'N/A'}
+              </p>
+              <p style={{ margin: '4px 0', fontSize: '0.95em' }}>
+                <strong>Damage Count:</strong> {selectedTrackGroup.damage_count ?? 0}
+              </p>
+              <p style={{ margin: '4px 0', fontSize: '0.95em' }}>
+                <strong>Type:</strong> {selectedTrackGroup.defect_type ?? 'Aggregated'}
+              </p>
+            </div>
+          )}
+          {selectedCluster && !selectedTrackGroup && (
             <div style={{ clear: 'both', marginTop: '16px' }}>
               <p style={{ margin: '4px 0', fontSize: '0.95em' }}>
                 <strong>Total Frames:</strong> {selectedCluster.markers.length}
@@ -920,23 +1450,61 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
         </div>
         
         <div className="sidebar-content">
-          {selectedCluster && selectedCluster.markers.map((feature, index) => {
+          {selectedTrackGroup && (
+              <div className="frame-item">
+                <h3 style={{ margin: '0 0 8px 0', fontSize: '1.1em', color: '#333' }}>
+                  Aggregated Segment
+                </h3>
+                <div style={{ fontSize: '0.9em', color: '#666' }}>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Tracks:</strong> {Array.isArray(selectedTrackGroup.track_ids) ? selectedTrackGroup.track_ids.join(', ') : 'N/A'}
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Damage Count:</strong> {selectedTrackGroup.damage_count ?? 0}
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Type:</strong> {selectedTrackGroup.defect_type ?? 'N/A'}
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Start Coord:</strong> {Array.isArray(selectedTrackGroup.start_coord) ? selectedTrackGroup.start_coord.map((c: number) => c.toFixed(5)).join(', ') : 'N/A'}
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>End Coord:</strong> {Array.isArray(selectedTrackGroup.end_coord) ? selectedTrackGroup.end_coord.map((c: number) => c.toFixed(5)).join(', ') : 'N/A'}
+                  </p>
+                </div>
+              </div>
+            )}
+          {selectedCluster && !selectedTrackGroup && sortedSidebarFrames.map((feature, index) => {
             const props = feature.properties;
+            const detections = Array.isArray(props?.all_detections_in_frame) ? props.all_detections_in_frame : [];
+            const frameKey = String(props?.frame_number ?? props?.frame_id ?? `frame-${index}`);
+            const isGridExpanded = expandedDetectionFrames.has(frameKey);
+            const handleToggleGrid = () => toggleDetectionGrid(frameKey);
             return (
-              <div key={index} className="frame-item">
+              <div key={props?.frame_number ?? props?.frame_id ?? index} className="frame-item">
                 <h3 style={{ margin: '0 0 8px 0', fontSize: '1.1em', color: '#333' }}>
                   Frame #{props?.frame_number ?? 'N/A'}
                 </h3>
                 
                 <div style={{ fontSize: '0.9em', color: '#666' }}>
-               
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Distance:</strong> {props?.actual_distance_feet?.toFixed(1) ?? 'N/A'} ft
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Speed:</strong> {props?.speed_mph?.toFixed(1) ?? 'N/A'} mph
+                  </p>
                   <p style={{ margin: '2px 0' }}>
                     <strong>Detections:</strong> {props?.detection_count_in_frame ?? 'N/A'}
                   </p>
-                 
-                  {/* <p style={{ margin: '2px 0' }}>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>Frame Type:</strong> ${props?.frame_type ?? 'N/A'}
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
+                    <strong>GPS Index:</strong> ${props?.gps_index ?? 'N/A'}
+                  </p>
+                  <p style={{ margin: '2px 0' }}>
                     <strong>Timestamp:</strong> ${props.globalTimestamp ? new Date(props.globalTimestamp).toLocaleString() : 'N/A'}
-                  </p> */}
+                  </p>
                 </div>
 
                 {/* Display image if available */}
@@ -968,17 +1536,76 @@ const MapComponent: React.FC<MapComponentProps> = ({ geojson, isSidebarOpen, set
                 )}
 
                 {/* Show detections if available */}
-                {props?.all_detections_in_frame && props.all_detections_in_frame.length > 0 && (
-                  <div className="detection-list">
-                    <h4 style={{ margin: '0 0 8px 0', fontSize: '0.95em', color: '#333' }}>
-                      Detections ({props.detection_count_in_frame}):
-                    </h4>
-                    {props.all_detections_in_frame.map((det: any, detIndex: number) => (
-                      <div key={detIndex} className="detection-item">
-                        <div><strong>Defect {detIndex + 1}:</strong></div>
-                        <div>Class ID: {crack_types[det.class_id] ?? 'N/A'}, Confidence: {det.confidence?.toFixed(2) ?? 'N/A'}</div>
+                {detections.length > 0 && (
+                  <div className={`detection-row-wrapper ${isGridExpanded ? 'expanded' : ''}`}>
+                    <div className="detection-row-header">
+                      <span><strong>Detections:</strong> {detections.length}</span>
+                      <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <span style={{ fontSize: '0.75em', color: '#6b7280' }}>
+                          {isGridExpanded ? 'Click thumbnails to hide grid' : 'Click thumbnails to expand grid'}
+                        </span>
+                        <button
+                          type="button"
+                          className="detection-toggle-btn"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleToggleGrid();
+                          }}
+                        >
+                          {isGridExpanded ? 'Hide grid' : 'Show grid'}
+                        </button>
                       </div>
-                    ))}
+                    </div>
+                    <div
+                      className="detection-preview-row"
+                      role="button"
+                      tabIndex={0}
+                      onClick={handleToggleGrid}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          handleToggleGrid();
+                        }
+                      }}
+                    >
+                      {detections.map((det: any, detIndex: number) => {
+                        const previewSrc = det?.thumbnail_url || det?.polygon_overlay_url || det?.annotated_image_url;
+                        const label = det?.class_name || det?.defect_type || `#${detIndex + 1}`;
+                        return (
+                          <div key={`${props?.frame_number ?? index}-preview-${det?.defect_id ?? detIndex}`} className="detection-thumb" title={label}>
+                            {previewSrc ? (
+                              <img src={previewSrc} alt={label} />
+                            ) : (
+                              label.slice(0, 3).toUpperCase()
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="detection-grid-popup">
+                      <div style={{ fontWeight: 600, marginBottom: '10px', color: '#111827', fontSize: '0.85em' }}>
+                        Frame {props?.frame_number ?? 'N/A'} detections
+                      </div>
+                      <div className="detection-grid">
+                        {detections.map((det: any, detIndex: number) => {
+                          const gridImage = det?.polygon_overlay_url || det?.measurement_overlay_url || det?.thumbnail_url || det?.annotated_image_url || det?.original_frame_url;
+                          const displayLabel = det?.class_name || det?.defect_type || `Detection ${detIndex + 1}`;
+                          const confidenceLabel = typeof det?.confidence === 'number' ? det.confidence.toFixed(2) : 'N/A';
+                          return (
+                            <div key={`${props?.frame_number ?? index}-grid-${det?.defect_id ?? detIndex}`} className="detection-grid-item">
+                              {gridImage && (
+                                <img src={gridImage} alt={displayLabel} />
+                              )}
+                              <div className="detection-grid-meta">
+                                <strong>{`#${detIndex + 1} ${displayLabel}`}</strong>
+                                <span>Confidence: {confidenceLabel}</span>
+                                {det?.track_id && <span>Track: {det.track_id}</span>}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
