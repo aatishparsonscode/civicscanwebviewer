@@ -53,6 +53,21 @@ interface SegmentCoverageRowData {
   thumbnails: { url: string; caption: string }[];
 }
 
+interface GpsFrameEntry {
+  frame_id: number;
+  timestamp: number;
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  accuracy: number;
+}
+
+interface GpsFrameMappingEntry {
+  jobId: string;
+  jobPrefix: string;
+  frames: GpsFrameEntry[];
+}
+
 const DEFAULT_TARGET_CONFIG: S3TargetConfig = {
   prefix: DEFAULT_RESULTS_PREFIX,
   mode: 'data',
@@ -672,18 +687,131 @@ const buildDefectImageUrls = (images: any = {}) => {
   return { thumbnail, annotated, original, measurement };
 };
 
-const convertParentTracksToFeatures = (features: any[]) => {
+const convertParentTracksToFeatures = (
+  features: any[],
+  gpsFrameMappings?: Record<string, GpsFrameMappingEntry>
+) => {
   const segments: any[] = [];
   const METERS_TO_FEET = 3.28084;
   const SEGMENT_LENGTH_FEET = 528; // 0.1 mile
 
-  const allTracks: any[] = [];
+  // Build a map of frame_id -> segment_id based on GPS coordinates
+  const buildFrameToSegmentMap = (frames: GpsFrameEntry[]): { frameToSegment: Map<number, number>; segmentCoords: Map<number, { start: [number, number]; end: [number, number] }> } => {
+    const frameToSegment = new Map<number, number>();
+    const segmentCoords = new Map<number, { start: [number, number]; end: [number, number] }>();
+
+    if (frames.length < 2) {
+      frames.forEach((frame, idx) => {
+        frameToSegment.set(frame.frame_id, 0);
+      });
+      if (frames.length > 0) {
+        segmentCoords.set(0, {
+          start: [frames[0].longitude, frames[0].latitude],
+          end: [frames[frames.length - 1].longitude, frames[frames.length - 1].latitude],
+        });
+      }
+      return { frameToSegment, segmentCoords };
+    }
+
+    // Calculate cumulative distance along the route
+    let cumulativeDistanceFeet = 0;
+    const frameDistances: { frame: GpsFrameEntry; distanceFeet: number }[] = [];
+
+    frames.forEach((frame, idx) => {
+      if (idx === 0) {
+        frameDistances.push({ frame, distanceFeet: 0 });
+      } else {
+        const prevFrame = frames[idx - 1];
+        const from = turf.point([prevFrame.longitude, prevFrame.latitude]);
+        const to = turf.point([frame.longitude, frame.latitude]);
+        const distanceFeet = turf.distance(from, to, { units: 'feet' });
+        cumulativeDistanceFeet += distanceFeet;
+        frameDistances.push({ frame, distanceFeet: cumulativeDistanceFeet });
+      }
+    });
+
+    // Assign each frame to a segment based on cumulative distance
+    const segmentFrames = new Map<number, GpsFrameEntry[]>();
+
+    frameDistances.forEach(({ frame, distanceFeet }) => {
+      const segmentId = Math.floor(distanceFeet / SEGMENT_LENGTH_FEET);
+      frameToSegment.set(frame.frame_id, segmentId);
+
+      if (!segmentFrames.has(segmentId)) {
+        segmentFrames.set(segmentId, []);
+      }
+      segmentFrames.get(segmentId)!.push(frame);
+    });
+
+    // Build segment start/end coordinates
+    segmentFrames.forEach((framesInSegment, segmentId) => {
+      if (framesInSegment.length > 0) {
+        const firstFrame = framesInSegment[0];
+        const lastFrame = framesInSegment[framesInSegment.length - 1];
+        segmentCoords.set(segmentId, {
+          start: [firstFrame.longitude, firstFrame.latitude],
+          end: [lastFrame.longitude, lastFrame.latitude],
+        });
+      }
+    });
+
+    return { frameToSegment, segmentCoords };
+  };
+
+  // Get frame IDs from a track (parent or child)
+  const getTrackFrameIds = (track: any): number[] => {
+    const frameIds: number[] = [];
+    const frameRange = track.frame_range;
+
+    if (Array.isArray(frameRange) && frameRange.length >= 2) {
+      const start = Number(frameRange[0]);
+      const end = Number(frameRange[1]);
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        for (let i = start; i <= end; i++) {
+          frameIds.push(i);
+        }
+      }
+    }
+
+    // Also check defects for frame IDs
+    const defects = Array.isArray(track.defects) ? track.defects : [];
+    defects.forEach((defect: any) => {
+      const defectFrameId = Number(defect.frame_id ?? defect.frame);
+      if (Number.isFinite(defectFrameId) && !frameIds.includes(defectFrameId)) {
+        frameIds.push(defectFrameId);
+      }
+    });
+
+    return frameIds;
+  };
+
+  // Get segments that a track overlaps based on its frame IDs
+  const getTrackSegments = (frameIds: number[], frameToSegment: Map<number, number>): Set<number> => {
+    const segmentIds = new Set<number>();
+    frameIds.forEach(frameId => {
+      const segmentId = frameToSegment.get(frameId);
+      if (segmentId !== undefined) {
+        segmentIds.add(segmentId);
+      }
+    });
+    return segmentIds;
+  };
+
+  // Process all parent tracks and their children
+  const allParentTracks: any[] = [];
+  const allChildTracks: any[] = [];
 
   features.forEach(feature => {
     if (!feature?.properties) return;
     const parentProps = feature.properties;
     const childTracks = Array.isArray(parentProps.child_tracks) ? parentProps.child_tracks : [];
     const parentJobId = extractJobIdFromSourceUrl(parentProps.sourceUrl);
+
+    // Store parent track info
+    const parentTrackId = parentProps.parent_track_id ?? parentProps.track_id;
+    const parentFrameIds = getTrackFrameIds(parentProps);
+
+    const processedChildren: any[] = [];
 
     childTracks.forEach((childTrack: any, idx: number) => {
       const defects = Array.isArray(childTrack.defects) ? childTrack.defects : [];
@@ -747,10 +875,12 @@ const convertParentTracksToFeatures = (features: any[]) => {
         ? childTrack.job_id
         : parentJobId;
 
-      allTracks.push({
+      const childFrameIds = getTrackFrameIds(childTrack);
+
+      const processedChild = {
         ...childTrack,
         job_id: trackJobId,
-        parent_track_id: parentProps.parent_track_id ?? parentProps.track_id,
+        parent_track_id: parentTrackId,
         track_damage: trackDamage,
         track_start_ts: startTimestamp,
         track_length_feet: trackLengthFeet,
@@ -760,109 +890,191 @@ const convertParentTracksToFeatures = (features: any[]) => {
         representative_thumbnail: representativeThumbnail,
         severity_labels: Array.from(severityLabels),
         source_geojson_url: parentProps.sourceUrl,
-      });
+        frame_ids: childFrameIds,
+      };
+
+      processedChildren.push(processedChild);
+      allChildTracks.push(processedChild);
+    });
+
+    allParentTracks.push({
+      parent_track_id: parentTrackId,
+      job_id: parentJobId,
+      frame_ids: parentFrameIds,
+      children: processedChildren,
+      source_geojson_url: parentProps.sourceUrl,
     });
   });
 
-  const orderedTracks = allTracks
-    .filter(t => t.coordinates && t.coordinates.length > 0)
-    .sort((a, b) => {
-      if (a.track_start_ts === null && b.track_start_ts === null) return 0;
-      if (a.track_start_ts === null) return 1;
-      if (b.track_start_ts === null) return -1;
-      return a.track_start_ts - b.track_start_ts;
-    });
+  // Build frame-to-segment mappings for each job
+  const jobFrameToSegment = new Map<string, { frameToSegment: Map<number, number>; segmentCoords: Map<number, { start: [number, number]; end: [number, number] }> }>();
 
-  if (orderedTracks.length === 0) {
-    return { lineFeatures: [], defectPointFeatures: [] };
+  if (gpsFrameMappings && Object.keys(gpsFrameMappings).length > 0) {
+    Object.entries(gpsFrameMappings).forEach(([jobId, entry]) => {
+      const mapping = buildFrameToSegmentMap(entry.frames);
+      jobFrameToSegment.set(jobId, mapping);
+    });
   }
 
-  let cumulativeFeet = 0;
-  orderedTracks.forEach(track => {
-    track.start_feet = cumulativeFeet;
-    track.end_feet = cumulativeFeet + (Number.isFinite(track.track_length_feet) ? track.track_length_feet : 0);
-    cumulativeFeet = track.end_feet;
+  // Assign tracks to segments using parent-first logic
+  const segmentData = new Map<string, {
+    damage: number;
+    trackIds: Set<any>;
+    defectTypes: Set<string>;
+    tracks: any[];
+    jobIds: Set<string>;
+  }>();
+
+  const createSegmentKey = (jobId: string, segmentId: number) => `${jobId}:${segmentId}`;
+
+  allParentTracks.forEach(parent => {
+    const jobId = parent.job_id || '';
+    const jobMapping = jobFrameToSegment.get(jobId);
+
+    if (!jobMapping) {
+      // No GPS mapping available, fall back to segment 0
+      const segKey = createSegmentKey(jobId, 0);
+      if (!segmentData.has(segKey)) {
+        segmentData.set(segKey, {
+          damage: 0,
+          trackIds: new Set(),
+          defectTypes: new Set(),
+          tracks: [],
+          jobIds: new Set(),
+        });
+      }
+      const segData = segmentData.get(segKey)!;
+      parent.children.forEach((child: any) => {
+        segData.damage += child.track_damage;
+        segData.trackIds.add(child.track_id);
+        segData.trackIds.add(parent.parent_track_id);
+        child.defect_types.forEach((dt: string) => segData.defectTypes.add(dt));
+        segData.tracks.push(child);
+        if (child.job_id) segData.jobIds.add(child.job_id);
+      });
+      return;
+    }
+
+    const { frameToSegment } = jobMapping;
+
+    // Get segments that parent track spans
+    const parentSegments = getTrackSegments(parent.frame_ids, frameToSegment);
+
+    if (parentSegments.size <= 1) {
+      // Parent fits in one segment - assign all children to that segment
+      const segmentId = parentSegments.size === 1 ? Array.from(parentSegments)[0] : 0;
+      const segKey = createSegmentKey(jobId, segmentId);
+
+      if (!segmentData.has(segKey)) {
+        segmentData.set(segKey, {
+          damage: 0,
+          trackIds: new Set(),
+          defectTypes: new Set(),
+          tracks: [],
+          jobIds: new Set(),
+        });
+      }
+
+      const segData = segmentData.get(segKey)!;
+      parent.children.forEach((child: any) => {
+        segData.damage += child.track_damage;
+        segData.trackIds.add(child.track_id);
+        segData.trackIds.add(parent.parent_track_id);
+        child.defect_types.forEach((dt: string) => segData.defectTypes.add(dt));
+        segData.tracks.push({ ...child, assigned_segment: segmentId });
+        if (child.job_id) segData.jobIds.add(child.job_id);
+      });
+    } else {
+      // Parent spans multiple segments - assign each child individually
+      parent.children.forEach((child: any) => {
+        const childSegments = getTrackSegments(child.frame_ids, frameToSegment);
+
+        // If child has no frame mappings, use parent's first segment
+        const segmentsToAssign = childSegments.size > 0
+          ? childSegments
+          : new Set([Array.from(parentSegments)[0]]);
+
+        // Assign child to ALL segments it overlaps
+        segmentsToAssign.forEach(segmentId => {
+          const segKey = createSegmentKey(jobId, segmentId);
+
+          if (!segmentData.has(segKey)) {
+            segmentData.set(segKey, {
+              damage: 0,
+              trackIds: new Set(),
+              defectTypes: new Set(),
+              tracks: [],
+              jobIds: new Set(),
+            });
+          }
+
+          const segData = segmentData.get(segKey)!;
+          segData.damage += child.track_damage;
+          segData.trackIds.add(child.track_id);
+          segData.trackIds.add(parent.parent_track_id);
+          child.defect_types.forEach((dt: string) => segData.defectTypes.add(dt));
+          segData.tracks.push({ ...child, assigned_segment: segmentId });
+          if (child.job_id) segData.jobIds.add(child.job_id);
+        });
+      });
+    }
   });
 
-  const orderedCoords: any[] = [];
-  orderedTracks.forEach((t) => {
-    t.coordinates.forEach((coord: any, idx: number) => {
-      if (idx === 0 && orderedCoords.length > 0) {
-        return;
+  // Build segment features with geometry from GPS coordinates
+  segmentData.forEach((data, segKey) => {
+    const [jobId, segmentIdStr] = segKey.split(':');
+    const segmentId = parseInt(segmentIdStr, 10);
+    const jobMapping = jobFrameToSegment.get(jobId);
+    const segmentCoords = jobMapping?.segmentCoords.get(segmentId);
+
+    // Build line geometry from segment coordinates or from track coordinates
+    let geometry: any = null;
+    if (segmentCoords) {
+      geometry = {
+        type: 'LineString',
+        coordinates: [segmentCoords.start, segmentCoords.end],
+      };
+    } else if (data.tracks.length > 0) {
+      // Fallback: use coordinates from first track
+      const firstTrack = data.tracks[0];
+      if (firstTrack.coordinates && firstTrack.coordinates.length > 0) {
+        geometry = {
+          type: 'LineString',
+          coordinates: firstTrack.coordinates,
+        };
       }
-      if (Array.isArray(coord) && coord.length === 2) {
-        orderedCoords.push(coord);
-      }
+    }
+
+    if (!geometry) {
+      return; // Skip segments with no geometry
+    }
+
+    const startCoord = geometry.coordinates[0];
+    const endCoord = geometry.coordinates[geometry.coordinates.length - 1];
+
+    segments.push({
+      type: 'Feature',
+      geometry,
+      properties: {
+        damage_count: data.damage,
+        track_ids: Array.from(data.trackIds),
+        segment_id: segmentId,
+        job_id: jobId,
+        segment_length_feet: SEGMENT_LENGTH_FEET,
+        defect_types: Array.from(data.defectTypes),
+        overlapping_tracks: data.tracks,
+        start_coord: startCoord,
+        end_coord: endCoord,
+        job_ids: Array.from(data.jobIds),
+      },
     });
   });
 
-  if (orderedCoords.length < 2) {
-    return { lineFeatures: [], defectPointFeatures: [] };
-  }
-
-  const line = turf.lineString(orderedCoords);
-  const chunked = turf.lineChunk(line, SEGMENT_LENGTH_FEET, { units: 'feet' });
-
-  let segStartFeet = 0;
-  chunked.features.forEach((segFeature: any) => {
-      const segLengthFeet = turf.length(segFeature, { units: 'feet' });
-      const segEndFeet = segStartFeet + segLengthFeet;
-
-      if (!Number.isFinite(segLengthFeet) || segLengthFeet <= 0) {
-        return;
-      }
-
-      let damage = 0;
-      const trackIds = new Set<any>();
-      const defectTypes = new Set<string>();
-      const segmentTracks: any[] = [];
-
-      orderedTracks.forEach(track => {
-        const overlaps = !(track.start_feet >= segEndFeet || track.end_feet <= segStartFeet);
-        if (overlaps) {
-          damage += track.track_damage;
-          if (track.track_id !== undefined) trackIds.add(track.track_id);
-          if (track.parent_track_id !== undefined) trackIds.add(track.parent_track_id);
-          (Array.isArray(track.defect_types) ? track.defect_types : []).forEach((dt: any) => {
-            if (dt) defectTypes.add(String(dt));
-          });
-          segmentTracks.push({
-            track_id: track.track_id,
-            parent_track_id: track.parent_track_id,
-            start_feet: track.start_feet,
-            end_feet: track.end_feet,
-            thumbnail_url: track.representative_thumbnail,
-            track_damage: track.track_damage,
-            defect_types: track.defect_types,
-            severity_labels: track.severity_labels,
-            measured_length_feet: track.measured_length_feet ?? track.track_length_feet,
-            job_id: track.job_id,
-            source_geojson_url: track.source_geojson_url,
-          });
-        }
-      });
-      const segmentJobIds = Array.from(
-        new Set(segmentTracks.map(t => t.job_id).filter((id): id is string => Boolean(id)))
-      );
-
-      segments.push({
-        type: 'Feature',
-        geometry: segFeature.geometry,
-        properties: {
-          damage_count: damage,
-          track_ids: Array.from(trackIds),
-          start_feet: segStartFeet,
-          end_feet: segEndFeet,
-          segment_length_feet: segLengthFeet,
-          defect_types: Array.from(defectTypes),
-          overlapping_tracks: segmentTracks,
-          start_coord: Array.isArray(segFeature.geometry?.coordinates) ? segFeature.geometry.coordinates[0] : null,
-          end_coord: Array.isArray(segFeature.geometry?.coordinates) ? segFeature.geometry.coordinates[segFeature.geometry.coordinates.length - 1] : null,
-          job_ids: segmentJobIds,
-        },
-      });
-
-    segStartFeet = segEndFeet;
+  // Sort segments by segment_id for consistent ordering
+  segments.sort((a, b) => {
+    const jobCompare = (a.properties.job_id || '').localeCompare(b.properties.job_id || '');
+    if (jobCompare !== 0) return jobCompare;
+    return (a.properties.segment_id || 0) - (b.properties.segment_id || 0);
   });
 
   return { lineFeatures: segments, defectPointFeatures: [] };
@@ -1178,6 +1390,7 @@ function MapPageContent() {
   const [error, setError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [jobVideoSegments, setJobVideoSegments] = useState<Record<string, JobVideoSegmentsEntry>>({});
+  const [gpsFrameMappings, setGpsFrameMappings] = useState<Record<string, GpsFrameMappingEntry>>({});
   const [selectedTrackGroupForVideo, setSelectedTrackGroupForVideo] = useState<any | null>(null);
   const [activeVideoSegmentId, setActiveVideoSegmentId] = useState<number | string | null>(null);
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
@@ -1490,6 +1703,81 @@ function MapPageContent() {
     return entries;
   };
 
+  const parseGpsFrameMappingCsv = (csvText: string): GpsFrameEntry[] => {
+    const lines = csvText.trim().split('\n');
+    if (lines.length < 2) return [];
+
+    // Skip header row
+    const dataLines = lines.slice(1);
+    const frames: GpsFrameEntry[] = [];
+
+    dataLines.forEach(line => {
+      const parts = line.split(',');
+      if (parts.length >= 6) {
+        const frame_id = parseInt(parts[0], 10);
+        const timestamp = parseFloat(parts[1]);
+        const latitude = parseFloat(parts[2]);
+        const longitude = parseFloat(parts[3]);
+        const altitude = parseFloat(parts[4]);
+        const accuracy = parseFloat(parts[5]);
+
+        if (
+          Number.isFinite(frame_id) &&
+          Number.isFinite(latitude) &&
+          Number.isFinite(longitude)
+        ) {
+          frames.push({
+            frame_id,
+            timestamp: Number.isFinite(timestamp) ? timestamp : 0,
+            latitude,
+            longitude,
+            altitude: Number.isFinite(altitude) ? altitude : 0,
+            accuracy: Number.isFinite(accuracy) ? accuracy : 0,
+          });
+        }
+      }
+    });
+
+    return frames.sort((a, b) => a.frame_id - b.frame_id);
+  };
+
+  const loadGpsFrameMappingsForJobPrefixes = async (jobPrefixes: string[]): Promise<Record<string, GpsFrameMappingEntry>> => {
+    if (!Array.isArray(jobPrefixes) || jobPrefixes.length === 0) {
+      return {};
+    }
+
+    const entries: Record<string, GpsFrameMappingEntry> = {};
+
+    await Promise.all(jobPrefixes.map(async jobPrefix => {
+      const normalizedJobPrefix = ensureTrailingSlash(jobPrefix);
+      const jobId = deriveJobIdFromPrefix(normalizedJobPrefix);
+      const csvKey = `${normalizedJobPrefix}data/gps_frame_mapping.csv`;
+      const url = `${S3_HTTP_BASE_URL}/${csvKey}`;
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const csvText = await res.text();
+        const frames = parseGpsFrameMappingCsv(csvText);
+
+        if (frames.length > 0) {
+          entries[jobId] = {
+            jobId,
+            jobPrefix: normalizedJobPrefix,
+            frames,
+          };
+          console.log(`[map] Loaded ${frames.length} GPS frames for job ${jobId}`);
+        }
+      } catch (err) {
+        console.warn(`No GPS frame mapping for ${normalizedJobPrefix}`, err);
+      }
+    }));
+
+    return entries;
+  };
+
   async function listMetadataGeojsonUrls(prefix: string): Promise<GeojsonListingResult> {
     const prefixes = await listCommonPrefixes(prefix);
 
@@ -1556,6 +1844,7 @@ function MapPageContent() {
     setSuccessMessage(null);
     setGeojson(null);
     setJobVideoSegments({});
+    setGpsFrameMappings({});
     setSelectedTrackGroupForVideo(null);
     setActiveVideoSegmentId(null);
 
@@ -1574,6 +1863,7 @@ function MapPageContent() {
       let allFeatures: any[] = [];
       const failedUrls: string[] = [];
       const videoSegmentsPromise = loadVideoSegmentsForJobPrefixes(jobPrefixes);
+      const gpsFrameMappingsPromise = loadGpsFrameMappingsForJobPrefixes(jobPrefixes);
 
       const fetchPromises = geojsonUrls.map(async (geojsonUrl, index) => {
         try {
@@ -1604,12 +1894,17 @@ function MapPageContent() {
       });
 
       await Promise.allSettled(fetchPromises);
-      const loadedVideoSegments = await videoSegmentsPromise;
+      const [loadedVideoSegments, loadedGpsFrameMappings] = await Promise.all([
+        videoSegmentsPromise,
+        gpsFrameMappingsPromise,
+      ]);
       setJobVideoSegments(loadedVideoSegments);
+      setGpsFrameMappings(loadedGpsFrameMappings);
       console.log(`[map] Loaded video segments for ${Object.keys(loadedVideoSegments).length} job(s).`);
+      console.log(`[map] Loaded GPS frame mappings for ${Object.keys(loadedGpsFrameMappings).length} job(s).`);
 
       if (isParentTrackDataset(allFeatures)) {
-        const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(allFeatures);
+        const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(allFeatures, loadedGpsFrameMappings);
         const combinedFeatures = [...lineFeatures, ...defectPointFeatures];
 
         if (combinedFeatures.length > 0) {
