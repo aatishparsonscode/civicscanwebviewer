@@ -1565,6 +1565,15 @@ function MapPageContent() {
       hlsInstance.on(Hls.Events.ERROR, (_event, data) => {
         console.error('[map] HLS.js error.', data);
       });
+      // Force highest quality level and prevent ABR from switching
+      hlsInstance.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        if (hlsInstance && data.levels.length > 0) {
+          const highestLevel = data.levels.length - 1;
+          hlsInstance.currentLevel = highestLevel;
+          hlsInstance.loadLevel = highestLevel;
+          console.log(`[map] Forcing highest quality level: ${highestLevel} (${data.levels[highestLevel]?.height}p)`);
+        }
+      });
       hlsInstance.loadSource(masterUrl);
       hlsInstance.attachMedia(videoElement);
     } else if (canUseNative) {
