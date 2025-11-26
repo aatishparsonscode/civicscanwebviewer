@@ -60,6 +60,7 @@ interface GpsFrameEntry {
   longitude: number;
   altitude: number;
   accuracy: number;
+  speed_mph?: number;
 }
 
 interface GpsFrameMappingEntry {
@@ -797,6 +798,18 @@ const convertParentTracksToFeatures = (
     return segmentIds;
   };
 
+  // Build a frame_id -> speed_mph lookup map from GPS frame mappings
+  const frameToSpeedMap = new Map<number, number>();
+  if (gpsFrameMappings) {
+    Object.values(gpsFrameMappings).forEach(mapping => {
+      mapping.frames.forEach(frame => {
+        if (frame.speed_mph !== undefined) {
+          frameToSpeedMap.set(frame.frame_id, frame.speed_mph);
+        }
+      });
+    });
+  }
+
   // Process all parent tracks and their children
   const allParentTracks: any[] = [];
   const allChildTracks: any[] = [];
@@ -825,8 +838,16 @@ const convertParentTracksToFeatures = (
         if (defectType) {
           defectTypes.add(defectType);
         }
+
+        // Only count damage if defect is not a sealed_crack AND speed >= 5 mph
         if (defectType !== 'sealed_crack') {
-          trackDamage += 1;
+          const defectFrameId = Number(defect.frame_id ?? defect.frame);
+          const frameSpeed = Number.isFinite(defectFrameId) ? frameToSpeedMap.get(defectFrameId) : undefined;
+
+          // Count damage only if speed is >= 5 mph (or if speed data is unavailable, count it to be safe)
+          if (frameSpeed === undefined || frameSpeed >= 5) {
+            trackDamage += 1;
+          }
         }
 
         const sev =
@@ -1747,7 +1768,37 @@ function MapPageContent() {
       }
     });
 
-    return frames.sort((a, b) => a.frame_id - b.frame_id);
+    // Sort frames by frame_id first
+    const sortedFrames = frames.sort((a, b) => a.frame_id - b.frame_id);
+
+    // Calculate speed for each frame based on distance and time between consecutive points
+    for (let i = 0; i < sortedFrames.length; i++) {
+      if (i === 0) {
+        sortedFrames[i].speed_mph = undefined; // First frame has no previous point
+      } else {
+        const prevFrame = sortedFrames[i - 1];
+        const currFrame = sortedFrames[i];
+
+        // Calculate distance in feet using Turf.js
+        const from = turf.point([prevFrame.longitude, prevFrame.latitude]);
+        const to = turf.point([currFrame.longitude, currFrame.latitude]);
+        const distanceFeet = turf.distance(from, to, { units: 'feet' });
+
+        // Calculate time difference in seconds
+        const timeDiffSeconds = currFrame.timestamp - prevFrame.timestamp;
+
+        // Calculate speed in mph: (feet/second) * (3600 seconds/hour) * (1 mile/5280 feet)
+        if (timeDiffSeconds > 0) {
+          const feetPerSecond = distanceFeet / timeDiffSeconds;
+          const mph = feetPerSecond * 3600 / 5280;
+          currFrame.speed_mph = mph;
+        } else {
+          currFrame.speed_mph = 0;
+        }
+      }
+    }
+
+    return sortedFrames;
   };
 
   const loadGpsFrameMappingsForJobPrefixes = async (jobPrefixes: string[]): Promise<Record<string, GpsFrameMappingEntry>> => {
