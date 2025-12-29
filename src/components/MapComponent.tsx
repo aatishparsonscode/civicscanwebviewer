@@ -730,10 +730,18 @@ const MapComponent: React.FC<MapComponentProps> = ({
             const totalDefectPct = props.total_defect_percentage_with_projections !== undefined ? props.total_defect_percentage_with_projections.toFixed(2) + '%' : 'N/A';
             const totalSealedPct = props.total_sealed_percentage_with_projections !== undefined ? props.total_sealed_percentage_with_projections.toFixed(2) + '%' : 'N/A';
 
+            // Get PCI information for tooltip
+            const pciScore = props.pci_score !== undefined ? props.pci_score : null;
+            const pciRating = props.pci_rating || 'N/A';
+            const pciTooltipInfo = pciScore !== null
+              ? `<strong>PCI:</strong> ${pciScore} (${pciRating})<br/><br/>`
+              : '';
+
             layer.bindTooltip(`
               <div style="font-family: 'Inter', sans-serif; font-size: 11px; line-height: 1.4;">
                 <strong style="font-size: 13px;">Segment #${props.segment_id ?? 'N/A'}</strong><br/>
                 <br/>
+                ${pciTooltipInfo}
                 <strong>Damage Coverage:</strong><br/>
                 Transverse: ${transverse}<br/>
                 Alligator: ${alligator}<br/>
@@ -747,16 +755,15 @@ const MapComponent: React.FC<MapComponentProps> = ({
               </div>
             `, { sticky: true });
 
-            const pciScore = props.pci_score !== undefined ? props.pci_score : null;
-            const pciRating = props.pci_rating || 'N/A';
-            const pciInfo = pciScore !== null
+            // Reuse PCI info for popup (with slightly different formatting)
+            const pciPopupInfo = pciScore !== null
               ? `<strong>PCI Score:</strong> ${pciScore} (${pciRating})<br/>`
               : '';
 
             layer.bindPopup(`
               <div style="font-family: 'Inter', sans-serif; font-size: 12px; line-height: 1.5;">
                 <strong style="font-size: 14px;">Segment #${props.segment_id ?? 'N/A'}</strong><br/>
-                ${pciInfo}
+                ${pciPopupInfo}
                 <br/>
                 <strong>Damage Coverage:</strong><br/>
                 Transverse: ${transverse}<br/>
