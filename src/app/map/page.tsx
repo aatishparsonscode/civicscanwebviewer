@@ -585,7 +585,7 @@ const aggregateDetectionsByFrame = (features: any[]): any[] => {
       frameFeature.properties.detection_count_in_frame = frameFeature.properties.all_detections_in_frame.length;
 
       const coords = summary.coordinates;
-      if (coords && coords.length === 2 && coords.every(value => typeof value === 'number' && Number.isFinite(value))) {
+      if (coords && coords.length === 2 && coords.every((value: any) => typeof value === 'number' && Number.isFinite(value))) {
         const accumulator = frameFeature.properties.__coordinateAccumulator;
         accumulator.lngSum += coords[0];
         accumulator.latSum += coords[1];
