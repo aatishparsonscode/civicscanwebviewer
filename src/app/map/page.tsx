@@ -7,6 +7,7 @@ import * as turf from '@turf/turf';
 import Hls from 'hls.js';
 import RoadGridVisualization from '../../components/RoadGridVisualization';
 import { calculatePCI, type PCIResult, type PixelPercentageData } from '../../utils/pciCalculator';
+import { CrackDotData, MapViewMode } from '../../types/crackDots';
 
 // Dynamically import MapComponent to ensure it only loads on the client side
 // We'll also pass sidebar state to it
@@ -1331,6 +1332,158 @@ const getVideoSegmentMidpoint = (segment: any): LatLng | null => {
   return start || end || null;
 };
 
+/**
+ * Calculate horizontal GPS offset based on pixel position in frame
+ *
+ * Logic:
+ * - centroid_px[0] = 0 (left edge) → offset -3 meters west
+ * - centroid_px[0] = 1920 (center) → offset 0 meters
+ * - centroid_px[0] = 3840 (right edge) → offset +3 meters east
+ *
+ * This prevents dots at same GPS location from overlapping
+ */
+function calculateHorizontalOffset(
+  gpsCoords: { latitude: number; longitude: number },
+  centroid_px: [number, number]
+): { latitude: number; longitude: number } {
+  const FRAME_WIDTH_4K = 3840; // Standard 4K frame width
+  const MAX_OFFSET_METERS = 3; // ±3 meters maximum horizontal offset
+
+  // Normalize pixel position to -1 to +1 range
+  // centroid_px[0] = 0 → -1 (left edge)
+  // centroid_px[0] = 1920 → 0 (center)
+  // centroid_px[0] = 3840 → +1 (right edge)
+  const normalized = (centroid_px[0] / FRAME_WIDTH_4K) * 2 - 1;
+
+  // Calculate offset in meters
+  const offsetMeters = normalized * MAX_OFFSET_METERS;
+
+  // Use turf.destination to offset perpendicular to road direction
+  // Bearing: 90° = east (right), 270° = west (left)
+  const point = turf.point([gpsCoords.longitude, gpsCoords.latitude]);
+  const bearing = offsetMeters >= 0 ? 90 : 270;
+  const offsetPoint = turf.destination(
+    point,
+    Math.abs(offsetMeters),
+    bearing,
+    { units: 'meters' }
+  );
+
+  const [lng, lat] = offsetPoint.geometry.coordinates;
+  return { latitude: lat, longitude: lng };
+}
+
+/**
+ * Extract all individual crack detections from parent track segments
+ *
+ * Iterates through all road segments, extracts defects from overlapping_tracks,
+ * calculates horizontal offset for each crack, and returns flat array
+ *
+ * @param geojson - GeoJSON FeatureCollection with LineString segments
+ * @returns Array of individual crack data with offset coordinates
+ */
+function extractIndividualCracks(geojson: any): CrackDotData[] {
+  if (!geojson?.features || !Array.isArray(geojson.features)) {
+    console.warn('[extractCracks] No features in geojson');
+    return [];
+  }
+
+  const cracks: CrackDotData[] = [];
+  let processedCount = 0;
+  let skippedCount = 0;
+
+  // Filter for LineString features (road segments)
+  const segments = geojson.features.filter(
+    (f: any) => f.geometry?.type === 'LineString'
+  );
+
+  console.log(`[extractCracks] Processing ${segments.length} segments`);
+
+  segments.forEach((segment: any) => {
+    const props = segment.properties || {};
+    const overlappingTracks = props.overlapping_tracks || [];
+    const segmentId = props.segment_id;
+
+    overlappingTracks.forEach((track: any) => {
+      const defects = track.defects || [];
+      const jobId = track.job_id || props.job_id;
+
+      defects.forEach((defect: any) => {
+        // Validate required fields
+        if (!defect.defect_id) {
+          skippedCount++;
+          return;
+        }
+
+        if (!defect.gps_coordinates?.latitude || !defect.gps_coordinates?.longitude) {
+          console.warn(`[extractCracks] Skipping defect ${defect.defect_id} - missing GPS`);
+          skippedCount++;
+          return;
+        }
+
+        if (!defect.location?.centroid_px || !Array.isArray(defect.location.centroid_px)) {
+          console.warn(`[extractCracks] Skipping defect ${defect.defect_id} - missing centroid_px`);
+          skippedCount++;
+          return;
+        }
+
+        // Calculate horizontal offset
+        const offsetCoords = calculateHorizontalOffset(
+          defect.gps_coordinates,
+          defect.location.centroid_px
+        );
+
+        // Extract image URLs (prioritize thumbnail, then polygon_overlay)
+        const images = {
+          thumbnail: convertS3UriToHttp(defect.images?.thumbnail),
+          polygon_overlay: convertS3UriToHttp(defect.images?.polygon_overlay),
+          measurement_overlay: convertS3UriToHttp(defect.images?.measurement_overlay),
+        };
+
+        // Extract measurements
+        const measurements = defect.measurements_pixel ? {
+          width_px: defect.measurements_pixel.width_px?.mean ||
+                    defect.measurements_pixel.width_px?.values?.[0],
+          length_px: defect.measurements_pixel.length_px,
+          area_px: defect.measurements_pixel.area_px,
+        } : undefined;
+
+        // Build crack dot data
+        const crackDot: CrackDotData = {
+          defect_id: defect.defect_id,
+          defect_type: defect.defect_type || 'unknown',
+          gps_coordinates: {
+            latitude: defect.gps_coordinates.latitude,
+            longitude: defect.gps_coordinates.longitude,
+          },
+          offset_gps_coordinates: offsetCoords,
+          centroid_px: defect.location.centroid_px,
+          severity: defect.severity?.joint_severity ||
+                   defect.severity?.pixel_severity ||
+                   defect.severity ||
+                   'unknown',
+          images,
+          measurements,
+          parent_segment_id: segmentId,
+          job_id: jobId,
+          frame_id: defect.frame_id || defect.frame,
+        };
+
+        cracks.push(crackDot);
+        processedCount++;
+      });
+    });
+  });
+
+  console.log(`[extractCracks] Extracted ${processedCount} cracks, skipped ${skippedCount}`);
+
+  // Log first few cracks for debugging
+  if (cracks.length > 0) {
+    console.log('[extractCracks] Sample crack data:', cracks.slice(0, 3));
+  }
+
+  return cracks;
+}
 
 function MapPageContent() {
   const [geojson, setGeojson] = useState<any | null>(null);
@@ -1342,6 +1495,10 @@ function MapPageContent() {
   const [selectedTrackGroupForVideo, setSelectedTrackGroupForVideo] = useState<any | null>(null);
   const [activeVideoSegmentId, setActiveVideoSegmentId] = useState<number | string | null>(null);
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
+
+  // Crack dots view state
+  const [mapViewMode, setMapViewMode] = useState<MapViewMode>('segments');
+  const [crackDotsData, setCrackDotsData] = useState<CrackDotData[]>([]);
 
   // State for sidebar in parent to control map width
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -1560,6 +1717,9 @@ function MapPageContent() {
     setError(null);
     setSelectedTrackGroupForVideo(null);
     setActiveVideoSegmentId(null);
+    // Clear crack dots data
+    setCrackDotsData([]);
+    setMapViewMode('segments'); // Reset to default view
   }, [targetConfig.prefix]);
 
   const parseS3Xml = (xmlText: string) => {
@@ -1889,6 +2049,21 @@ function MapPageContent() {
             },
           };
           setGeojson(combinedGeoJSON);
+
+          // Extract individual cracks for crack dots view
+          if (lineFeatures.length > 0) {
+            try {
+              const cracks = extractIndividualCracks(combinedGeoJSON);
+              setCrackDotsData(cracks);
+              console.log(`[map] Extracted ${cracks.length} individual cracks for dots view`);
+            } catch (err) {
+              console.error('[map] Error extracting cracks:', err);
+              setCrackDotsData([]); // Fallback to empty array
+            }
+          } else {
+            setCrackDotsData([]);
+          }
+
           setSuccessMessage('Data loaded');
         } else {
           setError('No parent tracks or defects found in provided data.');
@@ -1910,6 +2085,10 @@ function MapPageContent() {
           },
         };
         setGeojson(combinedGeoJSON);
+
+        // Clear crack dots data for aggregated frame features (not applicable)
+        setCrackDotsData([]);
+
         setSuccessMessage('Data loaded');
       } else {
         setError('No defects found in any results.');
@@ -1995,7 +2174,12 @@ function MapPageContent() {
                   cursor: loading ? 'not-allowed' : 'pointer',
                   transition: 'all 0.15s ease-in-out',
                   fontSize: '0.9rem',
-                  minWidth: '120px'
+                  minWidth: '150px',
+                  height: '40px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '0.5rem'
                 }}
                 onMouseEnter={(e) => {
                   if (!loading) {
@@ -2010,6 +2194,54 @@ function MapPageContent() {
               >
                 {loading ? 'Loading...' : 'Load Maps'}
               </button>
+
+              {/* View mode toggle button */}
+              {geojson && crackDotsData.length > 0 && (
+                <button
+                  onClick={() => setMapViewMode(mode => mode === 'segments' ? 'cracks' : 'segments')}
+                  style={{
+                    background: mapViewMode === 'cracks' ? '#8b5cf6' : '#6b7280',
+                    color: 'white',
+                    fontWeight: '600',
+                    padding: '0.5rem 1rem',
+                    borderRadius: '8px',
+                    border: 'none',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease-in-out',
+                    fontSize: '0.9rem',
+                    minWidth: '150px',
+                    height: '40px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '0.5rem'
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.opacity = '0.9';
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.opacity = '1';
+                  }}
+                >
+                  <span style={{ fontSize: '1.1rem' }}>
+                    {mapViewMode === 'cracks' ? '🔴' : '🛣️'}
+                  </span>
+                  <span>
+                    {mapViewMode === 'cracks' ? 'Defect Points' : 'Road Segments'}
+                  </span>
+                </button>
+              )}
+
+              {/* Show defect count */}
+              {crackDotsData.length > 0 && (
+                <span style={{
+                  color: '#6b7280',
+                  fontSize: '0.9rem',
+                  fontWeight: '500'
+                }}>
+                  {crackDotsData.length.toLocaleString()} defects detected
+                </span>
+              )}
 
               {loading && (
                 <span style={{
@@ -2182,6 +2414,8 @@ function MapPageContent() {
             setIsSidebarOpen={setIsSidebarOpen}
             sidebarWidth={sidebarWidth}
             onSegmentSelected={handleSegmentSelectionChange}
+            viewMode={mapViewMode}
+            crackDotsData={crackDotsData}
           />
         </div>
       </div>

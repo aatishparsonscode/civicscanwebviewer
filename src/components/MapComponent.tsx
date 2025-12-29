@@ -3,7 +3,7 @@
 // frontend/src/components/MapComponent.tsx
 'use client'; // This directive ensures the component is rendered on the client side
 
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { MapContainer, TileLayer } from 'react-leaflet';
 import L from 'leaflet';
 
@@ -19,6 +19,9 @@ import 'leaflet.markercluster';
 
 // Import PCI utilities
 import { getPCIColor } from '../utils/astmDeductTables';
+
+// Import crack dots types
+import { CrackDotData, MapViewMode } from '../types/crackDots';
 
 // Import Esri Leaflet for Esri basemaps
 import * as EsriLeaflet from 'esri-leaflet';
@@ -41,6 +44,8 @@ interface MapComponentProps {
   setIsSidebarOpen: (isOpen: boolean) => void; // Prop from parent
   sidebarWidth: number; // Prop from parent
   onSegmentSelected?: (segment: any | null) => void;
+  viewMode?: MapViewMode; // View mode: 'segments' or 'cracks'
+  crackDotsData?: CrackDotData[]; // Individual crack data for crack dots view
 }
 
 interface ClusterData {
@@ -59,18 +64,43 @@ const ZOOM_THRESHOLDS = {
   INDIVIDUAL_MARKERS: 19 // Individual markers only at zoom 16 and above
 };
 
+// Defect type colors (ordered by severity - most to least severe)
+const DEFECT_TYPE_COLORS: Record<string, string> = {
+  pothole: '#dc2626',      // bright red - most dangerous/severe
+  alligator: '#ea580c',    // dark orange - structural failure
+  longitudinal: '#fb923c', // light orange - moderate severity
+  transverse: '#fbbf24',   // yellow/amber - less severe
+  sealed_crack: '#6b7280', // gray - already repaired
+  default: '#6b7280',      // gray fallback
+};
+
+/**
+ * Get color for defect type
+ */
+function getDefectColor(defectType: string): string {
+  const normalized = defectType.toLowerCase();
+  return DEFECT_TYPE_COLORS[normalized] || DEFECT_TYPE_COLORS.default;
+}
+
 const MapComponent: React.FC<MapComponentProps> = ({
   geojson,
   isSidebarOpen,
   setIsSidebarOpen,
   sidebarWidth,
   onSegmentSelected,
+  viewMode = 'segments', // Default to segments view
+  crackDotsData = [],    // Default to empty array
 }) => {
   const mapRef = useRef<L.Map>(null);
   const clusterGroupRef = useRef<L.MarkerClusterGroup | null>(null);
   const pathDensityLayerRef = useRef<L.GeoJSON | null>(null);
   const crackLinesLayerRef = useRef<L.GeoJSON | null>(null);
   const individualMarkersLayerRef = useRef<L.LayerGroup | null>(null);
+
+  // Crack dots layer refs
+  const crackDotsClusterRef = useRef<L.MarkerClusterGroup | null>(null);
+  const crackDotsIndividualRef = useRef<L.LayerGroup | null>(null);
+
   const [selectedCluster, setSelectedCluster] = useState<ClusterData | null>(null);
   const [selectedTrackGroup, setSelectedTrackGroup] = useState<any | null>(null);
   const [segmentModalOpen, setSegmentModalOpen] = useState(false);
@@ -215,6 +245,8 @@ const MapComponent: React.FC<MapComponentProps> = ({
   const [expandedDetectionFrames, setExpandedDetectionFrames] = useState<Set<string>>(() => new Set());
   // Removed internal isSidebarOpen, screenSize states as they are now props
   const [currentZoom, setCurrentZoom] = useState(13);
+  const [hoveredDefect, setHoveredDefect] = useState<CrackDotData | null>(null);
+
   const sortedSidebarFrames = useMemo(() => {
     if (!selectedCluster?.markers) {
       return [];
@@ -371,13 +403,14 @@ const MapComponent: React.FC<MapComponentProps> = ({
   };
 
   // Function to update layer visibility based on zoom level
-  const updateLayerVisibility = (zoom: number) => {
+  /**
+   * Update map layer visibility based on zoom level AND view mode
+   */
+  const updateLayerVisibility = useCallback((zoom: number) => {
     if (!mapRef.current) return;
-
     const map = mapRef.current;
 
-    // Remove all layers first
-    // pathDensityLayerRef removed - using crack grid segments only
+    // Remove ALL layers first
     if (crackLinesLayerRef.current && map.hasLayer(crackLinesLayerRef.current)) {
       map.removeLayer(crackLinesLayerRef.current);
     }
@@ -387,32 +420,69 @@ const MapComponent: React.FC<MapComponentProps> = ({
     if (individualMarkersLayerRef.current && map.hasLayer(individualMarkersLayerRef.current)) {
       map.removeLayer(individualMarkersLayerRef.current);
     }
-
-    // Add layers based on zoom level
-    if (zoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS) {
-      // Highest zoom: crack grid segments + individual markers
-      if (crackLinesLayerRef.current) {
-        map.addLayer(crackLinesLayerRef.current);
-      }
-      if (individualMarkersLayerRef.current) {
-        map.addLayer(individualMarkersLayerRef.current);
-      }
-    } else if (zoom >= ZOOM_THRESHOLDS.CLUSTERS_VISIBLE) {
-      // Medium zoom: crack grid segments + clusters
-      if (crackLinesLayerRef.current) {
-        map.addLayer(crackLinesLayerRef.current);
-      }
-      if (clusterGroupRef.current) {
-        map.addLayer(clusterGroupRef.current);
-      }
-    } else if (zoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE) {
-      // Low-medium zoom: crack grid segments only
-      if (crackLinesLayerRef.current) {
-        map.addLayer(crackLinesLayerRef.current);
-      }
+    // Remove crack dots layers
+    if (crackDotsClusterRef.current && map.hasLayer(crackDotsClusterRef.current)) {
+      map.removeLayer(crackDotsClusterRef.current);
     }
-    // Below PATHS_VISIBLE zoom: no layers shown
-  };
+    if (crackDotsIndividualRef.current && map.hasLayer(crackDotsIndividualRef.current)) {
+      map.removeLayer(crackDotsIndividualRef.current);
+    }
+
+    // Add layers based on VIEW MODE
+    if (viewMode === 'cracks') {
+      // DEFECT POINTS VIEW: Show individual defects as colored points
+      console.log(`[MapComponent] Defect points view - zoom ${zoom}`);
+
+      if (zoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS) {
+        // Zoom 19+: Show individual defect points with tooltips
+        if (crackDotsIndividualRef.current) {
+          map.addLayer(crackDotsIndividualRef.current);
+          console.log('[MapComponent] Showing individual defect points');
+        }
+      } else {
+        // All other zoom levels: Show clustered defect points
+        if (crackDotsClusterRef.current) {
+          map.addLayer(crackDotsClusterRef.current);
+          console.log('[MapComponent] Showing clustered defect points');
+        }
+      }
+    } else {
+      // SEGMENTS VIEW (default): Show road segments
+      console.log(`[MapComponent] Segments view - zoom ${zoom}`);
+
+      if (zoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS) {
+        // Zoom 19+: Segments + individual frame markers
+        if (crackLinesLayerRef.current) {
+          map.addLayer(crackLinesLayerRef.current);
+        }
+        if (individualMarkersLayerRef.current) {
+          map.addLayer(individualMarkersLayerRef.current);
+        }
+      } else if (zoom >= ZOOM_THRESHOLDS.CLUSTERS_VISIBLE) {
+        // Zoom 16-18: Segments + frame clusters
+        if (crackLinesLayerRef.current) {
+          map.addLayer(crackLinesLayerRef.current);
+        }
+        if (clusterGroupRef.current) {
+          map.addLayer(clusterGroupRef.current);
+        }
+      } else if (zoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE) {
+        // Zoom 11-15: Segments only
+        if (crackLinesLayerRef.current) {
+          map.addLayer(crackLinesLayerRef.current);
+        }
+      }
+      // Below zoom 11: No layers shown
+    }
+  }, [viewMode]);
+
+  // Update layer visibility when view mode changes
+  useEffect(() => {
+    if (mapRef.current) {
+      const zoom = mapRef.current.getZoom();
+      updateLayerVisibility(zoom);
+    }
+  }, [viewMode, updateLayerVisibility]);
 
   // Memoize the processed path segments AND their min/max densities
   const processedPathSegments = useMemo(() => {
@@ -669,6 +739,109 @@ const MapComponent: React.FC<MapComponentProps> = ({
     return null;
   };
 
+  /**
+   * Create circular marker for individual crack with color-coding, tooltip, and popup
+   *
+   * @param crack - Crack dot data with offset coordinates
+   * @param isForCluster - If true, skip tooltip for performance
+   */
+  const createCrackDotMarker = (crack: CrackDotData, isForCluster: boolean = false) => {
+    const { latitude, longitude } = crack.offset_gps_coordinates;
+    const color = getDefectColor(crack.defect_type);
+
+    // Create circular marker at offset location
+    const marker = L.circleMarker([latitude, longitude], {
+      radius: 5,
+      color: color,
+      fillColor: color,
+      fillOpacity: 0.8,
+      weight: 2,
+      opacity: 1,
+    });
+
+    // Store crack data on marker for cluster grouping
+    (marker as any).crackData = crack;
+
+    // Add hover handlers to show preview panel (skip for cluster markers)
+    if (!isForCluster) {
+      marker.on('mouseover', () => {
+        setHoveredDefect(crack);
+      });
+
+      marker.on('mouseout', () => {
+        setHoveredDefect(null);
+      });
+    }
+
+    // Click popup with full details
+    let popupContent = `
+      <div style="max-width: 330px; font-family: 'Inter', sans-serif; font-size: 0.9em;">
+        <h3 style="margin: 0 0 10px 0; color: #333; font-size: 1.1em;">Crack Detection</h3>
+        <p style="margin: 4px 0;"><strong>Type:</strong> <span style="text-transform: capitalize;">${crack.defect_type}</span></p>
+        <p style="margin: 4px 0;"><strong>Severity:</strong> ${crack.severity}</p>
+        <p style="margin: 4px 0;"><strong>ID:</strong> <code style="font-size: 0.85em;">${crack.defect_id}</code></p>
+        <p style="margin: 4px 0;"><strong>GPS:</strong> ${crack.gps_coordinates.latitude.toFixed(6)}, ${crack.gps_coordinates.longitude.toFixed(6)}</p>
+    `;
+
+    // Add measurements if available
+    if (crack.measurements) {
+      popupContent += `<hr style="margin: 8px 0; border: none; border-top: 1px solid #e5e7eb;" />`;
+      popupContent += `<p style="margin: 4px 0; font-size: 0.9em; color: #666;"><strong>Measurements:</strong></p>`;
+
+      if (crack.measurements.area_px) {
+        popupContent += `<p style="margin: 2px 0 2px 12px; font-size: 0.85em;">Area: ${crack.measurements.area_px.toFixed(0)} px²</p>`;
+      }
+      if (crack.measurements.length_px) {
+        popupContent += `<p style="margin: 2px 0 2px 12px; font-size: 0.85em;">Length: ${crack.measurements.length_px.toFixed(0)} px</p>`;
+      }
+      if (crack.measurements.width_px) {
+        popupContent += `<p style="margin: 2px 0 2px 12px; font-size: 0.85em;">Width: ${crack.measurements.width_px.toFixed(0)} px</p>`;
+      }
+    }
+
+    // Add segment/job info
+    if (crack.parent_segment_id || crack.job_id) {
+      popupContent += `<hr style="margin: 8px 0; border: none; border-top: 1px solid #e5e7eb;" />`;
+      if (crack.parent_segment_id) {
+        popupContent += `<p style="margin: 2px 0; font-size: 0.85em; color: #666;">Segment: ${crack.parent_segment_id}</p>`;
+      }
+      if (crack.job_id) {
+        popupContent += `<p style="margin: 2px 0; font-size: 0.85em; color: #666;">Job: ${crack.job_id}</p>`;
+      }
+      if (crack.frame_id) {
+        popupContent += `<p style="margin: 2px 0; font-size: 0.85em; color: #666;">Frame: ${crack.frame_id}</p>`;
+      }
+    }
+
+    // Add image if available
+    const popupImage = crack.images?.polygon_overlay || crack.images?.thumbnail;
+    if (popupImage) {
+      popupContent += `
+        <img src="${popupImage}" alt="Crack detail"
+             style="max-width: 100%; height: auto; border-radius: 6px;
+                    margin-top: 10px; max-height: 250px; object-fit: contain;
+                    border: 1px solid #e5e7eb;"
+             loading="lazy" />
+      `;
+    }
+
+    popupContent += `</div>`;
+
+    marker.bindPopup(popupContent, {
+      maxWidth: 340,
+      autoClose: false,
+      closeOnClick: false,
+      className: 'custom-click-popup',
+      offset: L.point(0, -10)
+    });
+
+    marker.on('click', function () {
+      marker.openPopup();
+    });
+
+    return marker;
+  };
+
   useEffect(() => {
     if (mapRef.current) {
       // Clear existing layers
@@ -683,6 +856,13 @@ const MapComponent: React.FC<MapComponentProps> = ({
       }
       if (individualMarkersLayerRef.current) {
         mapRef.current.removeLayer(individualMarkersLayerRef.current);
+      }
+      // Clear crack dots layers
+      if (crackDotsClusterRef.current) {
+        mapRef.current.removeLayer(crackDotsClusterRef.current);
+      }
+      if (crackDotsIndividualRef.current) {
+        mapRef.current.removeLayer(crackDotsIndividualRef.current);
       }
 
       // Path density layer disabled - using crack grid segments only
@@ -894,6 +1074,90 @@ const MapComponent: React.FC<MapComponentProps> = ({
       clusterGroupRef.current = clusterGroup;
       individualMarkersLayerRef.current = individualMarkersLayer;
 
+      // Create defect points layers
+      if (crackDotsData && crackDotsData.length > 0) {
+        console.log(`[MapComponent] Creating defect points layers for ${crackDotsData.length} defects`);
+
+        // Create cluster group for crack dots
+        const crackDotsCluster = (L as any).markerClusterGroup({
+          maxClusterRadius: 50,
+          spiderfyOnMaxZoom: false,
+          showCoverageOnHover: false,
+          zoomToBoundsOnClick: true,
+          disableClusteringAtZoom: ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS,
+
+          iconCreateFunction: function(cluster: any) {
+            const childMarkers = cluster.getAllChildMarkers();
+            const totalCracks = childMarkers.length;
+
+            // Use red for all clusters
+            const color = '#ef4444'; // Red color
+
+            // Size based on crack count
+            let size = 40;
+            if (totalCracks < 10) size = 35;
+            else if (totalCracks < 50) size = 40;
+            else if (totalCracks < 200) size = 45;
+            else size = 50;
+
+            // Create colored cluster icon
+            return new L.DivIcon({
+              html: `<div style="
+                background-color: ${color};
+                border-radius: 50%;
+                width: ${size}px;
+                height: ${size}px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border: 3px solid rgba(255,255,255,0.9);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+              ">
+                <span style="
+                  color: white;
+                  font-weight: bold;
+                  font-size: 12px;
+                  text-shadow: 1px 1px 2px rgba(0,0,0,0.8);
+                ">${totalCracks}</span>
+              </div>`,
+              className: 'crack-dots-cluster',
+              iconSize: new L.Point(size, size)
+            });
+          }
+        });
+
+        // Create individual markers layer group
+        const crackDotsIndividual = L.layerGroup();
+
+        // Add markers to both layers
+        crackDotsData.forEach((crack) => {
+          try {
+            // Cluster marker (no tooltip for performance)
+            const clusterMarker = createCrackDotMarker(crack, true);
+            if (clusterMarker) {
+              crackDotsCluster.addLayer(clusterMarker);
+            }
+
+            // Individual marker (with tooltip)
+            const individualMarker = createCrackDotMarker(crack, false);
+            if (individualMarker) {
+              crackDotsIndividual.addLayer(individualMarker);
+            }
+          } catch (err) {
+            console.error('[MapComponent] Error creating crack marker:', crack.defect_id, err);
+          }
+        });
+
+        crackDotsClusterRef.current = crackDotsCluster;
+        crackDotsIndividualRef.current = crackDotsIndividual;
+
+        console.log(`[MapComponent] Created defect points layers successfully`);
+      } else {
+        // No crack data - clear refs
+        crackDotsClusterRef.current = null;
+        crackDotsIndividualRef.current = null;
+      }
+
       // Set up zoom event listener
       mapRef.current.on('zoomend', () => {
         if (mapRef.current) {
@@ -949,7 +1213,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
       mapRef.current.setView([47.6, -122.3], 13);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected, visualizationMode]); // Added visualization mode
+  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected, visualizationMode, viewMode, crackDotsData]); // Added viewMode and crackDotsData
 
   return (
     <div style={{ height: '100%', width: '100%', position: 'relative' }}>
@@ -966,11 +1230,143 @@ const MapComponent: React.FC<MapComponentProps> = ({
         zIndex: 1000,
         boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
       }}>
-        Zoom: {currentZoom} |
-        {currentZoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS ? ' Individual Markers' :
-         currentZoom >= ZOOM_THRESHOLDS.CLUSTERS_VISIBLE ? ' Paths + Clusters' :
-         currentZoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE ? ' Paths Only' : ' No Layers'}
+        <div>Zoom: {currentZoom}</div>
+        <div style={{ fontSize: '0.85em', color: '#666', marginTop: '2px' }}>
+          {viewMode === 'cracks' ? (
+            // Defect points view layers
+            currentZoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS ? 'Individual Points' : 'Clustered Points'
+          ) : (
+            // Segments view layers
+            currentZoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS ? 'Segments + Markers' :
+            currentZoom >= ZOOM_THRESHOLDS.CLUSTERS_VISIBLE ? 'Segments + Clusters' :
+            currentZoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE ? 'Segments Only' : 'Zoom in to see data'
+          )}
+        </div>
+        {viewMode === 'cracks' && crackDotsData.length > 0 && (
+          <div style={{ fontSize: '0.75em', color: '#999', marginTop: '2px' }}>
+            {crackDotsData.length.toLocaleString()} defects
+          </div>
+        )}
       </div>
+
+      {/* Legend for defect points view */}
+      {viewMode === 'cracks' && crackDotsData.length > 0 && (
+        <div style={{
+          position: 'absolute',
+          bottom: '10px',
+          left: '10px',
+          background: 'rgba(255, 255, 255, 0.9)',
+          padding: '10px 12px',
+          borderRadius: '4px',
+          fontSize: '0.8em',
+          fontFamily: 'Inter, sans-serif',
+          zIndex: 1000,
+          boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
+          maxWidth: '150px'
+        }}>
+          <div style={{ fontWeight: 'bold', marginBottom: '6px', fontSize: '0.9em' }}>
+            Defect Types
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <div style={{
+                width: '12px',
+                height: '12px',
+                borderRadius: '50%',
+                backgroundColor: DEFECT_TYPE_COLORS.alligator,
+                border: '1px solid white',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+              }} />
+              <span>Alligator</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <div style={{
+                width: '12px',
+                height: '12px',
+                borderRadius: '50%',
+                backgroundColor: DEFECT_TYPE_COLORS.longitudinal,
+                border: '1px solid white',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+              }} />
+              <span>Longitudinal</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <div style={{
+                width: '12px',
+                height: '12px',
+                borderRadius: '50%',
+                backgroundColor: DEFECT_TYPE_COLORS.transverse,
+                border: '1px solid white',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+              }} />
+              <span>Transverse</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <div style={{
+                width: '12px',
+                height: '12px',
+                borderRadius: '50%',
+                backgroundColor: DEFECT_TYPE_COLORS.pothole,
+                border: '1px solid white',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.2)'
+              }} />
+              <span>Pothole</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fixed preview panel for defect points */}
+      {hoveredDefect && (
+        <div style={{
+          position: 'absolute',
+          right: '20px',
+          top: '50%',
+          transform: 'translateY(-50%)',
+          background: 'rgba(255, 255, 255, 0.95)',
+          padding: '16px',
+          borderRadius: '8px',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+          zIndex: 1001,
+          maxWidth: '50vw',
+          maxHeight: '80vh',
+          overflow: 'auto',
+          fontFamily: 'Inter, sans-serif'
+        }}>
+          <div style={{ marginBottom: '12px' }}>
+            <h3 style={{ margin: '0 0 8px 0', fontSize: '1.1em', color: '#333', textTransform: 'capitalize' }}>
+              {hoveredDefect.defect_type}
+            </h3>
+            <p style={{ margin: '4px 0', fontSize: '0.9em', color: '#666' }}>
+              <strong>Severity:</strong> {hoveredDefect.severity}
+            </p>
+            <p style={{ margin: '4px 0', fontSize: '0.85em', color: '#999' }}>
+              ID: {hoveredDefect.defect_id}
+            </p>
+          </div>
+          {(hoveredDefect.images?.thumbnail || hoveredDefect.images?.polygon_overlay || hoveredDefect.images?.measurement_overlay) ? (
+            <img
+              src={hoveredDefect.images?.thumbnail || hoveredDefect.images?.polygon_overlay || hoveredDefect.images?.measurement_overlay}
+              alt="Defect preview"
+              style={{
+                width: '100%',
+                minWidth: '30vw',
+                height: 'auto',
+                minHeight: '30vh',
+                borderRadius: '6px',
+                maxHeight: '70vh',
+                objectFit: 'contain',
+                border: '1px solid #e5e7eb'
+              }}
+              loading="lazy"
+            />
+          ) : (
+            <p style={{ color: '#999', fontSize: '0.9em', textAlign: 'center', padding: '20px' }}>
+              No image preview available
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Visualization mode toggle */}
       <div style={{
