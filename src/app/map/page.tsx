@@ -5,6 +5,8 @@ import dynamic from 'next/dynamic';
 import { useSearchParams } from 'next/navigation';
 import * as turf from '@turf/turf';
 import Hls from 'hls.js';
+import RoadGridVisualization from '../../components/RoadGridVisualization';
+import { calculatePCI, type PCIResult, type PixelPercentageData } from '../../utils/pciCalculator';
 
 // Dynamically import MapComponent to ensure it only loads on the client side
 // We'll also pass sidebar state to it
@@ -15,7 +17,7 @@ const DynamicMapComponent = dynamic(() => import('../../components/MapComponent'
 
 const S3_HTTP_BASE_URL = 'https://civicscan-data-dev-usw2.s3.us-west-2.amazonaws.com';
 const S3_URI_BASE = 's3://civicscan-data-dev-usw2/';
-const DEFAULT_RESULTS_PREFIX = 'customer_outputs/cal15/data/';
+const DEFAULT_RESULTS_PREFIX = 'customer_outputs/franklin_county/data/';
 const DEFAULT_RESULTS_LABEL = DEFAULT_RESULTS_PREFIX.replace(/^customer_outputs\//, '').replace(/\/$/, '');
 const PREFIX_QUERY_PARAM_KEYS = ['prefix', 'output', 'dataset', 'postfix', 'path', 'customer_output', 'county'];
 
@@ -42,15 +44,6 @@ interface JobVideoSegmentsEntry {
 interface LatLng {
   lat: number;
   lng: number;
-}
-
-interface SegmentCoverageRowData {
-  id: string;
-  description: string;
-  coverageLeftPct: number;
-  coverageWidthPct: number;
-  dots: { leftPct: number; tooltip: string }[];
-  thumbnails: { url: string; caption: string }[];
 }
 
 interface GpsFrameEntry {
@@ -690,7 +683,8 @@ const buildDefectImageUrls = (images: any = {}) => {
 
 const convertParentTracksToFeatures = (
   features: any[],
-  gpsFrameMappings?: Record<string, GpsFrameMappingEntry>
+  gpsFrameMappings?: Record<string, GpsFrameMappingEntry>,
+  videoSegments?: Record<string, JobVideoSegmentsEntry>
 ) => {
   const segments: any[] = [];
   const METERS_TO_FEET = 3.28084;
@@ -828,12 +822,19 @@ const convertParentTracksToFeatures = (
 
     childTracks.forEach((childTrack: any, idx: number) => {
       const defects = Array.isArray(childTrack.defects) ? childTrack.defects : [];
+      const parentMeasuredLength = Number(childTrack.measured_real_length);
       let trackDamage = 0;
       const defectTypes = new Set<string>();
       let representativeThumbnail: string | null = null;
       const severityLabels = new Set<string>();
 
-      defects.forEach((defect: any) => {
+      // Add measured_real_length to each defect for PCI calculation
+      const enrichedDefects = defects.map((defect: any) => ({
+        ...defect,
+        measured_real_length: Number.isFinite(parentMeasuredLength) ? parentMeasuredLength : undefined
+      }));
+
+      enrichedDefects.forEach((defect: any) => {
         const defectType = (defect.defect_type || '').toLowerCase();
         if (defectType) {
           defectTypes.add(defectType);
@@ -900,6 +901,7 @@ const convertParentTracksToFeatures = (
 
       const processedChild = {
         ...childTrack,
+        defects: enrichedDefects, // Use enriched defects with measured_real_length
         job_id: trackJobId,
         parent_track_id: parentTrackId,
         track_damage: trackDamage,
@@ -1042,6 +1044,9 @@ const convertParentTracksToFeatures = (
   });
 
   // Build segment features with geometry from GPS coordinates
+  console.log(`\n🛣️  Processing ${segmentData.size} segments for PCI calculation...`);
+  let segmentsProcessed = 0;
+
   segmentData.forEach((data, segKey) => {
     const [jobId, segmentIdStr] = segKey.split(':');
     const segmentId = parseInt(segmentIdStr, 10);
@@ -1073,20 +1078,65 @@ const convertParentTracksToFeatures = (
     const startCoord = geometry.coordinates[0];
     const endCoord = geometry.coordinates[geometry.coordinates.length - 1];
 
+    // Find matching segment in segments_index.json to get pixel percentage data
+    let pixelData: any = {};
+    let pixelPercentages: PixelPercentageData = {};
+
+    if (videoSegments && videoSegments[jobId]?.segmentsIndex?.segments) {
+      const matchingSegment = videoSegments[jobId].segmentsIndex.segments.find(
+        (seg: any) => seg.segment_id === (segmentId + 1) // segment_id in JSON is 1-indexed
+      );
+      if (matchingSegment) {
+        // Extract pixel percentages for PCI calculation
+        pixelPercentages = matchingSegment.pixel_percentage_with_projections || {};
+
+        // Store full pixel data for segment properties
+        pixelData = {
+          pixel_percentage_with_projections: matchingSegment.pixel_percentage_with_projections,
+          total_defect_percentage_with_projections: matchingSegment.total_defect_percentage_with_projections,
+          total_sealed_percentage_with_projections: matchingSegment.total_sealed_percentage_with_projections,
+          pixel_coverage_percentage_by_type: matchingSegment.pixel_coverage_percentage_by_type,
+          total_defect_percentage: matchingSegment.total_defect_percentage,
+          total_sealed_percentage: matchingSegment.total_sealed_percentage,
+        };
+      } else {
+        console.warn(`No segment data found for segment ${segmentId} (Job: ${jobId})`);
+      }
+    }
+
+    // Calculate PCI using pixel-based formula
+    const pciResult = calculatePCI(pixelPercentages, {
+      verbose: false, // Set to true for detailed per-segment logging
+      segmentId: `${segmentId} (Job: ${jobId})`
+    });
+    segmentsProcessed++;
+
     segments.push({
       type: 'Feature',
       geometry,
       properties: {
         damage_count: data.damage,
         track_ids: Array.from(data.trackIds),
-        segment_id: segmentId,
+        segment_id: segmentId + 1, // 1-indexed to match segments_index.json
         job_id: jobId,
         segment_length_feet: SEGMENT_LENGTH_FEET,
+        start_feet: segmentId * SEGMENT_LENGTH_FEET,
+        end_feet: (segmentId + 1) * SEGMENT_LENGTH_FEET,
         defect_types: Array.from(data.defectTypes),
         overlapping_tracks: data.tracks,
         start_coord: startCoord,
         end_coord: endCoord,
         job_ids: Array.from(data.jobIds),
+        // PCI data
+        pci_score: pciResult.pci_score,
+        pci_rating: pciResult.pci_rating,
+        pci_details: {
+          total_deduct_value: pciResult.total_deduct_value,
+          deduct_breakdown: pciResult.deduct_breakdown,
+          damage_metrics: pciResult.damage_metrics,
+        },
+        // Pixel percentage data from segments_index.json
+        ...pixelData,
       },
     });
   });
@@ -1097,6 +1147,57 @@ const convertParentTracksToFeatures = (
     if (jobCompare !== 0) return jobCompare;
     return (a.properties.segment_id || 0) - (b.properties.segment_id || 0);
   });
+
+  console.log(`\n✅ PCI calculation complete for ${segmentsProcessed} segments`);
+
+  // Summary statistics
+  const pciScores = segments.map(s => s.properties.pci_score).filter(score => score !== undefined);
+  if (pciScores.length > 0) {
+    const avgPCI = pciScores.reduce((sum, score) => sum + score, 0) / pciScores.length;
+    const minPCI = Math.min(...pciScores);
+    const maxPCI = Math.max(...pciScores);
+
+    console.log('📊 PCI Summary Statistics:', {
+      totalSegments: pciScores.length,
+      averagePCI: avgPCI.toFixed(1),
+      minPCI: minPCI.toFixed(1),
+      maxPCI: maxPCI.toFixed(1),
+      distribution: {
+        excellent: pciScores.filter(s => s >= 85).length,
+        good: pciScores.filter(s => s >= 70 && s < 85).length,
+        fair: pciScores.filter(s => s >= 55 && s < 70).length,
+        poor: pciScores.filter(s => s >= 40 && s < 55).length,
+        veryPoor: pciScores.filter(s => s >= 25 && s < 40).length,
+        failed: pciScores.filter(s => s < 25).length,
+      }
+    });
+
+    // Debug: Check first segment's PCI data
+    if (segments.length > 0) {
+      const firstSeg = segments[0];
+      console.log('[PCI Debug] First segment raw data:', {
+        segment_id: firstSeg.properties.segment_id,
+        pci_score: firstSeg.properties.pci_score,
+        pci_rating: firstSeg.properties.pci_rating,
+        damage_count: firstSeg.properties.damage_count,
+        pci_details: firstSeg.properties.pci_details,
+      });
+    }
+
+    // Create a table view of segments
+    const tableData = segments.map(s => ({
+      Segment: s.properties.segment_id,
+      Job: s.properties.job_id?.substring(0, 8) || 'N/A',
+      'PCI Score': s.properties.pci_score?.toFixed(1) || 'N/A',
+      Rating: s.properties.pci_rating || 'N/A',
+      Defects: s.properties.damage_count || 0,
+      'Damage %': s.properties.pci_details?.damage_metrics?.damage_percentage?.toFixed(1) || '0',
+      'Deduct': s.properties.pci_details?.total_deduct_value?.toFixed(1) || '0',
+    }));
+
+    console.log('\n📋 Segment-by-Segment Results:');
+    console.table(tableData);
+  }
 
   return { lineFeatures: segments, defectPointFeatures: [] };
 };
@@ -1152,83 +1253,6 @@ const normalizeSegmentsIndexPayload = (segmentsIndex: any, jobPrefix: string) =>
   };
 };
 
-interface LengthFilterState {
-  min: string;
-  max: string;
-}
-
-const parseLengthFilterValue = (value: string | null | undefined): number | null => {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  const numericValue = Number(trimmed);
-  return Number.isFinite(numericValue) ? numericValue : null;
-};
-
-const filterGeojsonByLength = (geojson: any, filter: LengthFilterState) => {
-  if (!geojson || !Array.isArray(geojson.features)) {
-    return geojson;
-  }
-
-  const minLength = parseLengthFilterValue(filter?.min);
-  const maxLength = parseLengthFilterValue(filter?.max);
-  const filterActive = minLength !== null || maxLength !== null;
-
-  if (!filterActive) {
-    return geojson;
-  }
-
-  let filteredDetectionTotal = 0;
-
-  const filteredFeatures = geojson.features.reduce((acc: any[], feature: any) => {
-    if (feature?.geometry?.type && feature.geometry.type !== 'Point') {
-      acc.push(feature);
-      return acc;
-    }
-
-    const detections = Array.isArray(feature?.properties?.all_detections_in_frame)
-      ? feature.properties.all_detections_in_frame
-      : [];
-
-    const filteredDetections = detections.filter((det: any) => {
-      const detectionLength = coerceToFiniteNumber(det?.length_mm ?? det?.lengthMm);
-      if (detectionLength === null) {
-        return false;
-      }
-      if (minLength !== null && detectionLength < minLength) return false;
-      if (maxLength !== null && detectionLength > maxLength) return false;
-      return true;
-    });
-
-    if (filteredDetections.length === 0) {
-      return acc;
-    }
-
-    filteredDetectionTotal += filteredDetections.length;
-    acc.push({
-      ...feature,
-      properties: {
-        ...(feature.properties || {}),
-        all_detections_in_frame: filteredDetections,
-        detection_count_in_frame: filteredDetections.length,
-      },
-    });
-    return acc;
-  }, []);
-
-  return {
-    ...geojson,
-    features: filteredFeatures,
-    metadata: {
-      ...(geojson.metadata || {}),
-      filteredDetectionCount: filteredDetectionTotal,
-      appliedLengthFilter: {
-        min: minLength,
-        max: maxLength,
-      },
-    },
-  };
-};
 
 const deriveJobIdsFromTrackGroup = (group: any): string[] => {
   if (!group) return [];
@@ -1307,103 +1331,6 @@ const getVideoSegmentMidpoint = (segment: any): LatLng | null => {
   return start || end || null;
 };
 
-const buildSegmentCoverageRows = (group: any): SegmentCoverageRowData[] => {
-  if (!group) return [];
-  const tracks = Array.isArray(group.overlapping_tracks) ? group.overlapping_tracks : [];
-  if (tracks.length === 0) return [];
-
-  const segmentStart = Number(group.start_feet) || 0;
-  const explicitEnd = Number(group.end_feet);
-  const fallbackEnd = tracks.reduce((max, track) => Math.max(max, Number(track.end_feet) || max), segmentStart);
-  const segmentEnd = Number.isFinite(explicitEnd) ? explicitEnd : fallbackEnd;
-  const totalSpan = Math.max(1, segmentEnd - segmentStart);
-
-  const grouped = tracks.reduce((acc: any[], track: any) => {
-    const parentId = track.parent_track_id ?? track.track_id ?? `track-${acc.length}`;
-    let existing = acc.find((item: any) => item.parent_track_id === parentId);
-    if (!existing) {
-      existing = { parent_track_id: parentId, spans: [] as any[] };
-      acc.push(existing);
-    }
-    existing.spans.push({
-      ...track,
-      start_feet: Number(track.start_feet),
-      end_feet: Number(track.end_feet),
-    });
-    return acc;
-  }, []);
-
-  return grouped.map((groupEntry: any, idx: number) => {
-    const spans = groupEntry.spans
-      .map((span: any) => {
-        const safeStart = Number.isFinite(span.start_feet) ? span.start_feet : segmentStart;
-        const safeEnd = Number.isFinite(span.end_feet) ? span.end_feet : safeStart;
-        return { ...span, safeStart, safeEnd };
-      })
-      .sort((a: any, b: any) => a.safeStart - b.safeStart);
-
-    if (spans.length === 0) {
-      return null;
-    }
-
-    const clampValue = (val: number) => Math.max(0, Math.min(totalSpan, val));
-    const rowStart = Math.min(...spans.map((span: any) => Math.max(0, Math.min(segmentEnd, span.safeStart) - segmentStart)));
-    const rowEnd = Math.max(...spans.map((span: any) => Math.max(0, Math.min(segmentEnd, span.safeEnd) - segmentStart)));
-    const overlapStart = clampValue(Math.min(...spans.map((span: any) => Math.max(0, Math.min(segmentEnd, span.safeStart) - segmentStart))));
-    const overlapEnd = clampValue(Math.max(...spans.map((span: any) => Math.max(0, Math.min(segmentEnd, span.safeEnd) - segmentStart))));
-    const coverageLeftPct = Math.max(0, Math.min(100, (overlapStart / totalSpan) * 100));
-    const coverageWidthPct = Math.max(1, Math.min(100, ((overlapEnd - overlapStart) / totalSpan) * 100));
-
-    const defectSet = new Set<string>();
-    spans.forEach((span: any) => {
-      (Array.isArray(span.defect_types) ? span.defect_types : []).forEach((defect: any) => {
-        if (defect) defectSet.add(String(defect));
-      });
-    });
-
-    const dots = spans.map((span: any, dotIdx: number) => {
-      const clampStart = Math.max(segmentStart, span.safeStart);
-      const clampEnd = Math.min(segmentEnd, span.safeEnd);
-      const mid = ((clampStart + clampEnd) / 2) - segmentStart;
-      if (!Number.isFinite(mid)) return null;
-      const leftPct = (mid / totalSpan) * 100;
-      const severityLabel = Array.isArray(span.severity_labels) && span.severity_labels.length > 0
-        ? span.severity_labels.join(', ')
-        : 'unknown';
-      const tooltip = `Track ${span.track_id ?? dotIdx + 1} · Severity ${severityLabel}`;
-      return { leftPct: Math.max(0, Math.min(100, leftPct)), tooltip };
-    }).filter((dot): dot is { leftPct: number; tooltip: string } => Boolean(dot));
-
-    const thumbnails = spans
-      .map((span: any, thumbIdx: number) => {
-        if (!span.thumbnail_url) return null;
-        const damageType = Array.isArray(span.defect_types) && span.defect_types.length > 0
-          ? span.defect_types.join(', ')
-          : 'unknown';
-        const severityLabel = Array.isArray(span.severity_labels) && span.severity_labels.length > 0
-          ? span.severity_labels.join(', ')
-          : 'unknown';
-        const clampStart = Math.max(segmentStart, span.safeStart);
-        const clampEnd = Math.min(segmentEnd, span.safeEnd);
-        const lengthFeet = Math.max(0, clampEnd - clampStart);
-        const lengthLabel = Number.isFinite(lengthFeet) && lengthFeet > 0 ? `${lengthFeet.toFixed(1)}ft` : 'N/A';
-        const caption = `Defects: ${damageType} · Severity: ${severityLabel} · Length: ${lengthLabel}`;
-        return { url: span.thumbnail_url, caption };
-      })
-      .filter((thumb): thumb is { url: string; caption: string } => Boolean(thumb));
-
-    const description = `Defects: ${defectSet.size ? Array.from(defectSet).join(', ') : 'unknown'} · ${Math.max(0, rowEnd - rowStart).toFixed(1)}ft (${rowStart.toFixed(1)}ft - ${rowEnd.toFixed(1)}ft)`;
-
-    return {
-      id: String(groupEntry.parent_track_id ?? idx),
-      description,
-      coverageLeftPct,
-      coverageWidthPct,
-      dots,
-      thumbnails,
-    };
-  }).filter((row): row is SegmentCoverageRowData => Boolean(row));
-};
 
 function MapPageContent() {
   const [geojson, setGeojson] = useState<any | null>(null);
@@ -1415,23 +1342,18 @@ function MapPageContent() {
   const [selectedTrackGroupForVideo, setSelectedTrackGroupForVideo] = useState<any | null>(null);
   const [activeVideoSegmentId, setActiveVideoSegmentId] = useState<number | string | null>(null);
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
-  
+
   // State for sidebar in parent to control map width
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 }); // Added to dynamically calc sidebar width
-  const [lengthFilter, setLengthFilter] = useState<LengthFilterState>({ min: '', max: '' });
   const [controlsCollapsed, setControlsCollapsed] = useState(false);
   const searchParams = useSearchParams();
   const targetConfig = useMemo(() => getTargetConfigFromSearchParams(searchParams), [searchParams]);
   const targetS3Uri = `${S3_URI_BASE}${targetConfig.prefix}`;
   const targetDisplayLabel = targetConfig.datasetLabel;
-  const filteredGeojson = useMemo(
-    () => filterGeojsonByLength(geojson, lengthFilter),
-    [geojson, lengthFilter]
-  );
   const visibleDetectionCount = useMemo(() => {
-    if (!filteredGeojson?.features) return 0;
-    return filteredGeojson.features.reduce((sum: number, feature: any) => {
+    if (!geojson?.features) return 0;
+    return geojson.features.reduce((sum: number, feature: any) => {
       const frameCount = feature?.properties?.detection_count_in_frame;
       if (typeof frameCount === 'number' && Number.isFinite(frameCount)) {
         return sum + frameCount;
@@ -1441,8 +1363,7 @@ function MapPageContent() {
       }
       return sum;
     }, 0);
-  }, [filteredGeojson]);
-  const hasActiveLengthFilter = Boolean(lengthFilter.min.trim() || lengthFilter.max.trim());
+  }, [geojson]);
   const videoSegmentJobKeys = useMemo(() => Object.keys(jobVideoSegments), [jobVideoSegments]);
   const selectedTrackGroupJobIds = useMemo(
     () => deriveJobIdsFromTrackGroup(selectedTrackGroupForVideo),
@@ -1477,10 +1398,6 @@ function MapPageContent() {
     });
     return bestSegment;
   }, [selectedTrackGroupForVideo, activeVideoJobEntry]);
-  const coverageRows = useMemo(
-    () => buildSegmentCoverageRows(selectedTrackGroupForVideo),
-    [selectedTrackGroupForVideo]
-  );
   const activeVideoSegment = useMemo(() => {
     if (!activeVideoJobEntry?.segmentsIndex?.segments) {
       return null;
@@ -1615,19 +1532,12 @@ function MapPageContent() {
   }, [activeVideoSegment?.hls?.master_playlist_url, activeVideoSegment?.segment_id]);
 
   const getSidebarWidth = () => {
-    if (screenSize.width >= 1920) return 1000;
-    if (screenSize.width >= 1600) return 800;
-    if (screenSize.width >= 1200) return 500;
-    return 450;
+    if (screenSize.width >= 1920) return 2400; // 1600 * 1.5
+    if (screenSize.width >= 1600) return 2100; // 1400 * 1.5
+    if (screenSize.width >= 1200) return 1500; // 1000 * 1.5
+    return 1200; // 800 * 1.5
   };
   const sidebarWidth = getSidebarWidth(); // Calculate once per render cycle when screen size changes
-  const handleLengthFilterChange = (key: 'min' | 'max', value: string) => {
-    setLengthFilter(prev => ({
-      ...prev,
-      [key]: value,
-    }));
-  };
-  const resetLengthFilter = () => setLengthFilter({ min: '', max: '' });
   const handleSegmentSelectionChange = useCallback((segment: any | null) => {
     setSelectedTrackGroupForVideo(segment);
     if (!segment) {
@@ -1964,7 +1874,7 @@ function MapPageContent() {
       console.log(`[map] Loaded GPS frame mappings for ${Object.keys(loadedGpsFrameMappings).length} job(s).`);
 
       if (isParentTrackDataset(allFeatures)) {
-        const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(allFeatures, loadedGpsFrameMappings);
+        const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(allFeatures, loadedGpsFrameMappings, loadedVideoSegments);
         const combinedFeatures = [...lineFeatures, ...defectPointFeatures];
 
         if (combinedFeatures.length > 0) {
@@ -1979,7 +1889,7 @@ function MapPageContent() {
             },
           };
           setGeojson(combinedGeoJSON);
-          setSuccessMessage(`Loaded ${defectPointFeatures.length} crack points across ${lineFeatures.length} parent tracks in ${targetDisplayLabel || targetS3Uri}.`);
+          setSuccessMessage('Data loaded');
         } else {
           setError('No parent tracks or defects found in provided data.');
         }
@@ -2000,8 +1910,7 @@ function MapPageContent() {
           },
         };
         setGeojson(combinedGeoJSON);
-        const unitLabel = targetConfig.mode === 'data' ? 'files' : 'sources';
-        setSuccessMessage(`Loaded ${aggregatedFrameFeatures.length} frames (${allFeatures.length} detections) from ${geojsonUrls.length - failedUrls.length} ${unitLabel} in ${targetDisplayLabel || targetS3Uri}.`);
+        setSuccessMessage('Data loaded');
       } else {
         setError('No defects found in any results.');
       }
@@ -2013,10 +1922,6 @@ function MapPageContent() {
     }
   };
 
-  const videoTimelineSegments = Array.isArray(activeVideoJobEntry?.segmentsIndex?.segments)
-    ? activeVideoJobEntry.segmentsIndex.segments
-    : [];
-  const totalVideoDistanceFeet = Number(activeVideoJobEntry?.segmentsIndex?.total_distance_ft) || 0;
   const activeVideoJobId = activeVideoJobEntry?.jobId || selectedTrackGroupJobIds[0] || null;
   const clearSelectedSegment = () => {
     setSelectedTrackGroupForVideo(null);
@@ -2106,120 +2011,6 @@ function MapPageContent() {
                 {loading ? 'Loading...' : 'Load Maps'}
               </button>
 
-              <div style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '0.3rem',
-                minWidth: '230px',
-                flex: '1'
-              }}>
-                <span style={{
-                  fontSize: '0.8rem',
-                  fontWeight: 600,
-                  color: '#374151',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.05em'
-                }}>
-                  Length (mm) Filter
-                </span>
-                <div style={{
-                  display: 'flex',
-                  gap: '0.5rem',
-                  flexWrap: 'wrap',
-                  alignItems: 'center'
-                }}>
-                  <input
-                    type="number"
-                    inputMode="decimal"
-                    placeholder="Min"
-                    value={lengthFilter.min}
-                    onChange={(e) => handleLengthFilterChange('min', e.target.value)}
-                    style={{
-                      border: '1px solid #d1d5db',
-                      borderRadius: '6px',
-                      padding: '0.35rem 0.5rem',
-                      fontSize: '0.85rem',
-                      width: '90px',
-                      fontFamily: 'Inter, sans-serif'
-                    }}
-                    aria-label="Minimum length filter in millimeters"
-                  />
-                  <input
-                    type="number"
-                    inputMode="decimal"
-                    placeholder="Max"
-                    value={lengthFilter.max}
-                    onChange={(e) => handleLengthFilterChange('max', e.target.value)}
-                    style={{
-                      border: '1px solid #d1d5db',
-                      borderRadius: '6px',
-                      padding: '0.35rem 0.5rem',
-                      fontSize: '0.85rem',
-                      width: '90px',
-                      fontFamily: 'Inter, sans-serif'
-                    }}
-                    aria-label="Maximum length filter in millimeters"
-                  />
-                  {hasActiveLengthFilter && (
-                    <button
-                      type="button"
-                      onClick={resetLengthFilter}
-                      style={{
-                        background: '#e0e7ff',
-                        color: '#312e81',
-                        border: 'none',
-                        borderRadius: '6px',
-                        padding: '0.35rem 0.75rem',
-                        fontSize: '0.8rem',
-                        fontWeight: 600,
-                        cursor: 'pointer'
-                      }}
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
-                <span style={{
-                  fontSize: '0.75rem',
-                  color: '#6b7280'
-                }}>
-                  Only detections whose measured length falls within this range remain visible.
-                </span>
-              </div>
-
-              <div style={{
-                display: 'flex',
-                flexDirection: 'column',
-                minWidth: '240px',
-                gap: '0.2rem'
-              }}>
-                <span style={{
-                  fontSize: '0.8rem',
-                  fontWeight: 600,
-                  color: '#374151',
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.05em'
-                }}>
-                  Data Source
-                </span>
-                <code style={{
-                  fontSize: '0.85rem',
-                  background: '#eef2ff',
-                  padding: '0.25rem 0.5rem',
-                  borderRadius: '6px',
-                  color: '#1e40af',
-                  wordBreak: 'break-all'
-                }}>
-                  {targetS3Uri}
-                </code>
-                <span style={{
-                  fontSize: '0.75rem',
-                  color: '#6b7280'
-                }}>
-                  Override via ?dataset=sf2 or full ?prefix=customer_outputs/run
-                </span>
-              </div>
-
               {loading && (
                 <span style={{
                   color: '#6b7280',
@@ -2229,7 +2020,7 @@ function MapPageContent() {
                   Fetching data...
                 </span>
               )}
-              
+
               {error && (
                 <span style={{
                   color: '#dc2626',
@@ -2239,7 +2030,7 @@ function MapPageContent() {
                   {error}
                 </span>
               )}
-              
+
               {successMessage && (
                 <span style={{
                   color: '#059669',
@@ -2247,31 +2038,6 @@ function MapPageContent() {
                   fontWeight: '600'
                 }}>
                   ✓ {successMessage}
-                </span>
-              )}
-              
-              {videoSegmentJobKeys.length > 0 && (
-                <span style={{
-                  color: '#0f172a',
-                  fontSize: '0.85rem',
-                  fontWeight: 500
-                }}>
-                  Video segments ready for {videoSegmentJobKeys.length} job{videoSegmentJobKeys.length === 1 ? '' : 's'}.
-                </span>
-              )}
-              
-              {filteredGeojson?.features && (
-                <span style={{
-                  color: '#374151',
-                  fontSize: '0.85rem',
-                  fontWeight: 500
-                }}>
-                  Showing {filteredGeojson.features.length} features · {visibleDetectionCount} detections
-                  {hasActiveLengthFilter && filteredGeojson.features.length === 0 && (
-                    <span style={{ color: '#dc2626', marginLeft: '0.5rem' }}>
-                      No detections match the current length filter.
-                    </span>
-                  )}
                 </span>
               )}
             </div>
@@ -2282,6 +2048,7 @@ function MapPageContent() {
               background: '#ffffff',
               borderRadius: '12px',
               padding: '1rem',
+              paddingBottom: '300px',
               boxShadow: '0 15px 35px rgba(15, 23, 42, 0.15)',
               border: '1px solid rgba(99, 102, 241, 0.15)',
               display: 'flex',
@@ -2296,6 +2063,9 @@ function MapPageContent() {
                   </strong>
                   <span style={{ fontSize: '0.8rem', color: '#6b7280' }}>
                     Damage: {selectedTrackGroupForVideo.damage_count ?? 0} · Tracks: {Array.isArray(selectedTrackGroupForVideo.track_ids) ? selectedTrackGroupForVideo.track_ids.length : 0}
+                    {selectedTrackGroupForVideo.pci_score !== undefined && (
+                      <> · PCI: {selectedTrackGroupForVideo.pci_score} ({selectedTrackGroupForVideo.pci_rating})</>
+                    )}
                   </span>
                 </div>
                 <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
@@ -2328,7 +2098,7 @@ function MapPageContent() {
                       ref={videoPlayerRef}
                       controls
                       playsInline
-                      style={{ width: '100%', height: '220px', background: '#000' }}
+                      style={{ width: '100%', height: '450px', background: '#000', objectFit: 'contain' }}
                     />
                     {activeVideoSegment?.hls?.master_playlist_url && (
                       <a
@@ -2367,86 +2137,21 @@ function MapPageContent() {
                       No video metadata available for this job yet.
                     </div>
                   )}
-                  {videoTimelineSegments.length > 0 && (
-                    <div>
-                      <span style={{ fontSize: '0.75rem', color: '#6b7280' }}>Segments</span>
-                      <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.3rem', flexWrap: 'wrap' }}>
-                        {videoTimelineSegments.map((segment: any, idx: number) => {
-                          const distanceFeet = Number(segment.distance_end_ft) - Number(segment.distance_start_ft);
-                          const hasDistance = Number.isFinite(distanceFeet) && distanceFeet > 0 && totalVideoDistanceFeet > 0;
-                          const flexGrow = hasDistance ? Math.max(0.5, distanceFeet / totalVideoDistanceFeet) : 1;
-                          const isActive = activeVideoSegment?.segment_id === segment.segment_id;
-                          return (
-                            <button
-                              key={segment.segment_id ?? idx}
-                              type="button"
-                              onClick={() => setActiveVideoSegmentId(segment.segment_id ?? idx)}
-                              style={{
-                                flexGrow,
-                                flexBasis: '80px',
-                                minWidth: '70px',
-                                borderRadius: '8px',
-                                border: isActive ? '2px solid #4338ca' : '1px solid #c7d2fe',
-                                background: isActive ? '#e0e7ff' : '#f8fafc',
-                                color: '#1e3a8a',
-                                fontWeight: 600,
-                                padding: '0.35rem',
-                                cursor: 'pointer',
-                                fontSize: '0.8rem'
-                              }}
-                            >
-                              {segment.segment_id ?? idx + 1}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
                 </div>
                 <div style={{ flex: '1 1 360px', minWidth: '280px', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                  <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#111827' }}>Track coverage</div>
-                  {coverageRows.length > 0 ? (
-                    coverageRows.map(row => (
-                      <div key={row.id} style={{ border: '1px solid #e5e7eb', borderRadius: '10px', padding: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem', background: '#f9fafb' }}>
-                        <div style={{ fontSize: '0.85rem', color: '#374151' }}>{row.description}</div>
-                        <div style={{ position: 'relative', height: '18px', borderRadius: '999px', background: '#e5e7eb', overflow: 'hidden' }}>
-                          <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${row.coverageLeftPct}%`, width: `${row.coverageWidthPct}%`, background: '#6366f1', opacity: 0.6 }} />
-                          {row.dots.map((dot, dotIdx) => (
-                            <div
-                              key={`${row.id}-dot-${dotIdx}`}
-                              title={dot.tooltip}
-                              style={{
-                                position: 'absolute',
-                                top: '-4px',
-                                left: `calc(${dot.leftPct}% - 5px)`,
-                                width: '10px',
-                                height: '10px',
-                                borderRadius: '50%',
-                                background: '#f97316',
-                                border: '1px solid #fff',
-                                boxShadow: '0 1px 4px rgba(0,0,0,0.2)'
-                              }}
-                            />
-                          ))}
-                        </div>
-                        {row.thumbnails.length > 0 && (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                            {row.thumbnails.map((thumb, thumbIdx) => (
-                              <div key={`${row.id}-thumb-${thumbIdx}`} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                                <img
-                                  src={thumb.url}
-                                  alt={`thumb-${thumbIdx}`}
-                                  style={{ width: '80px', height: '56px', objectFit: 'cover', borderRadius: '8px', border: '1px solid #d1d5db' }}
-                                />
-                                <span style={{ fontSize: '0.8rem', color: '#374151' }}>{thumb.caption}</span>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    ))
+                  <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#111827' }}>Road Surface Visualization</div>
+                  {selectedTrackGroupForVideo?.overlapping_tracks && selectedTrackGroupForVideo.overlapping_tracks.length > 0 ? (
+                    <RoadGridVisualization
+                      key={`grid-${selectedTrackGroupForVideo.start_feet}-${selectedTrackGroupForVideo.end_feet}-${selectedTrackGroupForVideo.damage_count}`}
+                      tracks={selectedTrackGroupForVideo.overlapping_tracks}
+                      segmentStartFeet={Number(selectedTrackGroupForVideo.start_feet) || 0}
+                      segmentEndFeet={Number(selectedTrackGroupForVideo.end_feet) || Number(selectedTrackGroupForVideo.start_feet) + 528}
+                      segmentStartCoord={selectedTrackGroupForVideo.start_coord}
+                      segmentEndCoord={selectedTrackGroupForVideo.end_coord}
+                      pciDetails={selectedTrackGroupForVideo.pci_details}
+                    />
                   ) : (
-                    <div style={{ fontSize: '0.85rem', color: '#6b7280' }}>No overlapping tracks with thumbnails for this segment.</div>
+                    <div style={{ fontSize: '0.85rem', color: '#6b7280' }}>No track data available for this segment.</div>
                   )}
                 </div>
               </div>
@@ -2471,10 +2176,10 @@ function MapPageContent() {
           marginRight: isSidebarOpen ? `${sidebarWidth}px` : '0', // Pushes map to the left
         }}>
           {/* Pass sidebar state and width to MapComponent */}
-          <DynamicMapComponent 
-            geojson={filteredGeojson} 
-            isSidebarOpen={isSidebarOpen} 
-            setIsSidebarOpen={setIsSidebarOpen} 
+          <DynamicMapComponent
+            geojson={geojson}
+            isSidebarOpen={isSidebarOpen}
+            setIsSidebarOpen={setIsSidebarOpen}
             sidebarWidth={sidebarWidth}
             onSegmentSelected={handleSegmentSelectionChange}
           />

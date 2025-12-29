@@ -17,6 +17,9 @@ import 'leaflet.markercluster/dist/MarkerCluster.Default.css';
 // Import the MarkerClusterGroup
 import 'leaflet.markercluster';
 
+// Import PCI utilities
+import { getPCIColor } from '../utils/astmDeductTables';
+
 // Import Esri Leaflet for Esri basemaps
 import * as EsriLeaflet from 'esri-leaflet';
 
@@ -73,6 +76,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
   const [segmentModalOpen, setSegmentModalOpen] = useState(false);
   const [hoveredThumbnail, setHoveredThumbnail] = useState<string | null>(null);
   const [hoveredSegmentInfo, setHoveredSegmentInfo] = useState<any | null>(null);
+  const [visualizationMode, setVisualizationMode] = useState<'damage' | 'pci'>('pci'); // Toggle between damage count and PCI
 
   const openSegmentPage = (group: any) => {
     if (typeof window === 'undefined' || !group) return;
@@ -321,6 +325,17 @@ const MapComponent: React.FC<MapComponentProps> = ({
   }, [geojson]);
 
   const getTrackColor = (feature: any) => {
+    // Use PCI-based coloring if mode is 'pci'
+    if (visualizationMode === 'pci') {
+      const pciScore = feature?.properties?.pci_score;
+      if (pciScore !== undefined && pciScore !== null) {
+        return getPCIColor(pciScore);
+      }
+      // Fallback to green if no PCI data
+      return '#16a34a';
+    }
+
+    // Original damage count-based coloring
     const damageCount = Number(feature?.properties?.damage_count ?? 0);
     if (!Number.isFinite(damageCount) || damageCount <= 0) return '#16a34a'; // green
     const { p50, p75, p90, p95 } = damagePercentiles;
@@ -362,9 +377,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
     const map = mapRef.current;
 
     // Remove all layers first
-    if (pathDensityLayerRef.current && map.hasLayer(pathDensityLayerRef.current)) {
-      map.removeLayer(pathDensityLayerRef.current);
-    }
+    // pathDensityLayerRef removed - using crack grid segments only
     if (crackLinesLayerRef.current && map.hasLayer(crackLinesLayerRef.current)) {
       map.removeLayer(crackLinesLayerRef.current);
     }
@@ -377,7 +390,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
 
     // Add layers based on zoom level
     if (zoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS) {
-      // Highest zoom: only individual markers
+      // Highest zoom: crack grid segments + individual markers
       if (crackLinesLayerRef.current) {
         map.addLayer(crackLinesLayerRef.current);
       }
@@ -385,10 +398,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
         map.addLayer(individualMarkersLayerRef.current);
       }
     } else if (zoom >= ZOOM_THRESHOLDS.CLUSTERS_VISIBLE) {
-      // Medium zoom: paths + clusters
-      if (pathDensityLayerRef.current) {
-        map.addLayer(pathDensityLayerRef.current);
-      }
+      // Medium zoom: crack grid segments + clusters
       if (crackLinesLayerRef.current) {
         map.addLayer(crackLinesLayerRef.current);
       }
@@ -396,12 +406,9 @@ const MapComponent: React.FC<MapComponentProps> = ({
         map.addLayer(clusterGroupRef.current);
       }
     } else if (zoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE) {
-      // Low-medium zoom: only paths
+      // Low-medium zoom: crack grid segments only
       if (crackLinesLayerRef.current) {
         map.addLayer(crackLinesLayerRef.current);
-      }
-      if (pathDensityLayerRef.current) {
-        map.addLayer(pathDensityLayerRef.current);
       }
     }
     // Below PATHS_VISIBLE zoom: no layers shown
@@ -678,45 +685,13 @@ const MapComponent: React.FC<MapComponentProps> = ({
         mapRef.current.removeLayer(individualMarkersLayerRef.current);
       }
 
-      // Create path density layer
-      if (finalPathSegments && finalPathSegments.features.length > 0) {
-        // --- Use percentile thresholds for coloring ---
-        const { p50, p70, p85 } = percentileThresholds;
-
-        const pathLayer = L.geoJson(finalPathSegments, {
-          style: function (feature) {
-            const density = feature?.properties?.crack_density || 0;
-            let color = '#00FF00'; // Green: bottom 50%
-
-            if (density > p85) {
-              color = '#FF0000'; // Red: top 15% (above 85th percentile)
-            } else if (density > p70) {
-              color = '#FFA500'; // Orange: next 15% (between 70th and 85th percentile)
-            } else if (density > p50) {
-              color = '#FFFF00'; // Yellow: next 20% (between 50th and 70th percentile)
-            }
-            // Densities <= p50 remain green
-
-            return {
-              color: color,
-              weight: 8,
-              opacity: 0.8,
-              lineCap: 'round'
-            };
-          },
-          onEachFeature: function (feature, layer) {
-            if (feature.properties) {
-              layer.bindPopup(`
-                <strong>Path Segment:</strong><br/>
-                <strong>Detections:</strong> ${feature.properties.detections_in_segment ?? 'N/A'}<br/>
-                <strong>Density:</strong> ${feature.properties.crack_density?.toFixed(2) ?? 'N/A'} detections/ft<br/>
-                <strong>Length:</strong> ${feature.properties.actual_length_feet?.toFixed(1) ?? 'N/A'} ft
-              `);
-            }
-          }
-        });
-        pathDensityLayerRef.current = pathLayer;
-      }
+      // Path density layer disabled - using crack grid segments only
+      // if (finalPathSegments && finalPathSegments.features.length > 0) {
+      //   const { p50, p70, p85 } = percentileThresholds;
+      //   const pathLayer = L.geoJson(finalPathSegments, { ... });
+      //   pathDensityLayerRef.current = pathLayer;
+      // }
+      pathDensityLayerRef.current = null;
 
       // Parent track crack grid/segments (LineString or Polygon)
       const crackFeatures = geojson?.features
@@ -744,28 +719,63 @@ const MapComponent: React.FC<MapComponentProps> = ({
             const endLat = Array.isArray(endCoord) && endCoord.length >= 2 ? endCoord[1].toFixed(6) : 'N/A';
             const endLng = Array.isArray(endCoord) && endCoord.length >= 2 ? endCoord[0].toFixed(6) : 'N/A';
 
+            // Build damage percentages display
+            const pixelPercentages = props.pixel_percentage_with_projections || {};
+            const transverse = pixelPercentages.transverse !== undefined ? pixelPercentages.transverse.toFixed(2) + '%' : 'N/A';
+            const alligator = pixelPercentages.alligator !== undefined ? pixelPercentages.alligator.toFixed(2) + '%' : 'N/A';
+            const pothole = pixelPercentages.pothole !== undefined ? pixelPercentages.pothole.toFixed(2) + '%' : 'N/A';
+            const sealed = pixelPercentages.sealed_crack !== undefined ? pixelPercentages.sealed_crack.toFixed(2) + '%' : 'N/A';
+            const longitudinal = pixelPercentages.longitudinal !== undefined ? pixelPercentages.longitudinal.toFixed(2) + '%' : 'N/A';
+            const totalPct = pixelPercentages.total !== undefined ? pixelPercentages.total.toFixed(2) + '%' : 'N/A';
+            const totalDefectPct = props.total_defect_percentage_with_projections !== undefined ? props.total_defect_percentage_with_projections.toFixed(2) + '%' : 'N/A';
+            const totalSealedPct = props.total_sealed_percentage_with_projections !== undefined ? props.total_sealed_percentage_with_projections.toFixed(2) + '%' : 'N/A';
+
             layer.bindTooltip(`
-              <div style="font-family: 'Inter', sans-serif; font-size: 12px;">
-                <strong>Segment</strong><br/>
-                Damage: ${damage}<br/>
-                Start: ${startLat}, ${startLng}<br/>
-                End: ${endLat}, ${endLng}
+              <div style="font-family: 'Inter', sans-serif; font-size: 11px; line-height: 1.4;">
+                <strong style="font-size: 13px;">Segment #${props.segment_id ?? 'N/A'}</strong><br/>
+                <br/>
+                <strong>Damage Coverage:</strong><br/>
+                Transverse: ${transverse}<br/>
+                Alligator: ${alligator}<br/>
+                Pothole: ${pothole}<br/>
+                Sealed: ${sealed}<br/>
+                Longitudinal: ${longitudinal}<br/>
+                <br/>
+                <strong>Total:</strong> ${totalPct}<br/>
+                <strong>Total Defect:</strong> ${totalDefectPct}<br/>
+                <strong>Total Sealed:</strong> ${totalSealedPct}
               </div>
             `, { sticky: true });
 
+            const pciScore = props.pci_score !== undefined ? props.pci_score : null;
+            const pciRating = props.pci_rating || 'N/A';
+            const pciInfo = pciScore !== null
+              ? `<strong>PCI Score:</strong> ${pciScore} (${pciRating})<br/>`
+              : '';
+
             layer.bindPopup(`
-              <div style="font-family: 'Inter', sans-serif;">
-                <strong>Segment</strong><br/>
-                Tracks: ${tracks}<br/>
-                Damage: ${damage}<br/>
-                Defect types: ${Array.isArray(props.defect_types) && props.defect_types.length > 0 ? props.defect_types.join(', ') : 'N/A'}<br/>
+              <div style="font-family: 'Inter', sans-serif; font-size: 12px; line-height: 1.5;">
+                <strong style="font-size: 14px;">Segment #${props.segment_id ?? 'N/A'}</strong><br/>
+                ${pciInfo}
                 <br/>
-                <strong>Start:</strong> ${startLat}, ${startLng}<br/>
-                <strong>End:</strong> ${endLat}, ${endLng}
+                <strong>Damage Coverage:</strong><br/>
+                Transverse: ${transverse}<br/>
+                Alligator: ${alligator}<br/>
+                Pothole: ${pothole}<br/>
+                Sealed: ${sealed}<br/>
+                Longitudinal: ${longitudinal}<br/>
+                <br/>
+                <strong>Total:</strong> ${totalPct}<br/>
+                <strong>Total Defect:</strong> ${totalDefectPct}<br/>
+                <strong>Total Sealed:</strong> ${totalSealedPct}<br/>
+                <br/>
+                <strong>Damage Count:</strong> ${damage}<br/>
+                <strong>Tracks:</strong> ${Array.from(new Set(Array.isArray(props.track_ids) ? props.track_ids : [])).length}
               </div>
             `);
             layer.on('click', () => {
               const payload = {
+                segment_id: props.segment_id,
                 damage_count: damage,
                 track_ids: props.track_ids || [],
                 defect_type: props.defect_type || 'Aggregated',
@@ -775,6 +785,10 @@ const MapComponent: React.FC<MapComponentProps> = ({
                 start_feet: props.start_feet,
                 end_feet: props.end_feet,
                 job_ids: props.job_ids || [],
+                // PCI data
+                pci_score: props.pci_score,
+                pci_rating: props.pci_rating,
+                pci_details: props.pci_details,
               };
               setSelectedTrackGroup(payload);
               if (typeof onSegmentSelected === 'function') {
@@ -892,9 +906,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
       if (clusterGroup.getLayers().length > 0) {
         allLayers.push(clusterGroup);
       }
-      if (pathDensityLayerRef.current) {
-        allLayers.push(pathDensityLayerRef.current);
-      }
+      // pathDensityLayerRef removed - using crack grid segments only
       if (crackLinesLayerRef.current) {
         allLayers.push(crackLinesLayerRef.current);
       }
@@ -930,7 +942,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
       mapRef.current.setView([47.6, -122.3], 13);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected]); // Added setIsSidebarOpen to dependencies
+  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected, visualizationMode]); // Added visualization mode
 
   return (
     <div style={{ height: '100%', width: '100%', position: 'relative' }}>
@@ -947,10 +959,41 @@ const MapComponent: React.FC<MapComponentProps> = ({
         zIndex: 1000,
         boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
       }}>
-        Zoom: {currentZoom} | 
+        Zoom: {currentZoom} |
         {currentZoom >= ZOOM_THRESHOLDS.INDIVIDUAL_MARKERS ? ' Individual Markers' :
          currentZoom >= ZOOM_THRESHOLDS.CLUSTERS_VISIBLE ? ' Paths + Clusters' :
          currentZoom >= ZOOM_THRESHOLDS.PATHS_VISIBLE ? ' Paths Only' : ' No Layers'}
+      </div>
+
+      {/* Visualization mode toggle */}
+      <div style={{
+        position: 'absolute',
+        top: '50px',
+        left: '10px',
+        background: 'rgba(255, 255, 255, 0.9)',
+        padding: '8px 12px',
+        borderRadius: '4px',
+        fontSize: '0.85em',
+        fontFamily: 'Inter, sans-serif',
+        zIndex: 1000,
+        boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+      }}>
+        <button
+          onClick={() => setVisualizationMode(mode => mode === 'damage' ? 'pci' : 'damage')}
+          style={{
+            background: visualizationMode === 'pci' ? '#16a34a' : '#6b7280',
+            color: 'white',
+            border: 'none',
+            padding: '6px 12px',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontWeight: '500',
+            fontSize: '0.9em',
+            transition: 'background 0.2s'
+          }}
+        >
+          {visualizationMode === 'pci' ? '🎯 PCI Mode' : '📊 Damage Mode'}
+        </button>
       </div>
 
       <style jsx>{`
@@ -1474,7 +1517,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
           {selectedTrackGroup && (
               <div className="frame-item">
                 <h3 style={{ margin: '0 0 8px 0', fontSize: '1.1em', color: '#333' }}>
-                  Aggregated Segment
+                  Segment #{selectedTrackGroup.segment_id ?? 'N/A'}
                 </h3>
                 <div style={{ fontSize: '0.9em', color: '#666' }}>
                   <p style={{ margin: '2px 0' }}>
