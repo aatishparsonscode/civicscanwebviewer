@@ -18,7 +18,7 @@ import 'leaflet.markercluster/dist/MarkerCluster.Default.css';
 import 'leaflet.markercluster';
 
 // Import PCI utilities
-import { getPCIColor } from '../utils/astmDeductTables';
+import { getPCIColor, getRoughnessColor } from '../utils/astmDeductTables';
 
 // Import crack dots types
 import { CrackDotData, MapViewMode } from '../types/crackDots';
@@ -44,9 +44,10 @@ interface MapComponentProps {
   setIsSidebarOpen: (isOpen: boolean) => void; // Prop from parent
   sidebarWidth: number; // Prop from parent
   onSegmentSelected?: (segment: any | null) => void;
-  viewMode?: MapViewMode; // View mode: 'segments' or 'cracks'
+  viewMode?: MapViewMode; // View mode: 'segments', 'cracks', or 'roughness'
   crackDotsData?: CrackDotData[]; // Individual crack data for crack dots view
   frameDamageMappings?: Record<string, any>; // keyed by jobId, has .frames[frameId].lane_pixels
+  roughnessSegments?: any[]; // IRI-colored polyline segments
 }
 
 interface ClusterData {
@@ -92,6 +93,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
   viewMode = 'segments', // Default to segments view
   crackDotsData = [],    // Default to empty array
   frameDamageMappings,
+  roughnessSegments = [],
 }) => {
   const mapRef = useRef<L.Map>(null);
   const clusterGroupRef = useRef<L.MarkerClusterGroup | null>(null);
@@ -102,6 +104,9 @@ const MapComponent: React.FC<MapComponentProps> = ({
   // Crack dots layer refs
   const crackDotsClusterRef = useRef<L.MarkerClusterGroup | null>(null);
   const crackDotsIndividualRef = useRef<L.LayerGroup | null>(null);
+
+  // Roughness layer ref
+  const roughnessLayerRef = useRef<L.LayerGroup | null>(null);
 
   const [selectedCluster, setSelectedCluster] = useState<ClusterData | null>(null);
   const [selectedTrackGroup, setSelectedTrackGroup] = useState<any | null>(null);
@@ -434,9 +439,18 @@ const MapComponent: React.FC<MapComponentProps> = ({
     if (crackDotsIndividualRef.current && map.hasLayer(crackDotsIndividualRef.current)) {
       map.removeLayer(crackDotsIndividualRef.current);
     }
+    // Remove roughness layer
+    if (roughnessLayerRef.current && map.hasLayer(roughnessLayerRef.current)) {
+      map.removeLayer(roughnessLayerRef.current);
+    }
 
     // Add layers based on VIEW MODE
-    if (viewMode === 'cracks') {
+    if (viewMode === 'roughness') {
+      // ROUGHNESS VIEW: Show IRI-colored polylines
+      if (roughnessLayerRef.current) {
+        map.addLayer(roughnessLayerRef.current);
+      }
+    } else if (viewMode === 'cracks') {
       // DEFECT POINTS VIEW: Show individual defects as colored points
       console.log(`[MapComponent] Defect points view - zoom ${zoom}`);
 
@@ -848,6 +862,10 @@ const MapComponent: React.FC<MapComponentProps> = ({
       if (crackDotsIndividualRef.current) {
         mapRef.current.removeLayer(crackDotsIndividualRef.current);
       }
+      // Clear roughness layer
+      if (roughnessLayerRef.current) {
+        mapRef.current.removeLayer(roughnessLayerRef.current);
+      }
 
       // Path density layer disabled - using crack grid segments only
       // if (finalPathSegments && finalPathSegments.features.length > 0) {
@@ -1142,6 +1160,23 @@ const MapComponent: React.FC<MapComponentProps> = ({
         crackDotsIndividualRef.current = null;
       }
 
+      // Build roughness layer (IRI-colored polylines)
+      const roughnessLayer = L.layerGroup();
+      (roughnessSegments || []).forEach((seg: any) => {
+        const color = getRoughnessColor(seg.percentile_rank);
+        const line = L.polyline(seg.coords as L.LatLngExpression[], {
+          color,
+          weight: 6,
+          opacity: 0.85,
+        });
+        line.bindTooltip(
+          `<strong>Roughness:</strong> ${seg.percentile_rank.toFixed(0)}th percentile<br/><strong>Samples:</strong> ${seg.sample_count}`,
+          { sticky: true }
+        );
+        roughnessLayer.addLayer(line);
+      });
+      roughnessLayerRef.current = roughnessLayer;
+
       // Set up zoom event listener
       mapRef.current.on('zoomend', () => {
         if (mapRef.current) {
@@ -1197,7 +1232,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
       mapRef.current.setView([47.6, -122.3], 13);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected, visualizationMode, viewMode, crackDotsData]); // Added viewMode and crackDotsData
+  }, [geojson, finalPathSegments, minDensity, maxDensity, percentileThresholds, setIsSidebarOpen, onSegmentSelected, visualizationMode, viewMode, crackDotsData, roughnessSegments]);
 
   return (
     <div style={{ height: '100%', width: '100%', position: 'relative' }}>
@@ -1297,6 +1332,35 @@ const MapComponent: React.FC<MapComponentProps> = ({
               <span>Pothole</span>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Legend for roughness view */}
+      {viewMode === 'roughness' && (
+        <div style={{
+          position: 'absolute',
+          bottom: '30px',
+          right: '10px',
+          background: 'rgba(255,255,255,0.95)',
+          padding: '10px 14px',
+          borderRadius: '8px',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
+          zIndex: 1000,
+          fontSize: '0.8em',
+          fontFamily: 'Inter, sans-serif',
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: '6px', color: '#374151' }}>Roughness</div>
+          {([
+            ['#16a34a', 'Top 0–25%', 'Smoothest'],
+            ['#facc15', 'Top 25–50%', ''],
+            ['#f97316', 'Top 50–75%', ''],
+            ['#dc2626', 'Top 75–100%', 'Roughest'],
+          ] as [string, string, string][]).map(([color, range, label]) => (
+            <div key={range} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '3px' }}>
+              <div style={{ width: '14px', height: '14px', borderRadius: '3px', backgroundColor: color, flexShrink: 0 }} />
+              <span style={{ color: '#374151' }}><strong>{range}</strong>{label ? ` ${label}` : ''}</span>
+            </div>
+          ))}
         </div>
       )}
 

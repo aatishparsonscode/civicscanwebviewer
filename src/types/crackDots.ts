@@ -30,4 +30,4 @@ export interface CrackDotData {
   frame_id?: number;
 }
 
-export type MapViewMode = 'segments' | 'cracks';
+export type MapViewMode = 'segments' | 'cracks' | 'roughness';

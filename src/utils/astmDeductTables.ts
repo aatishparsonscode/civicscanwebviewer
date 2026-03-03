@@ -647,3 +647,10 @@ export function getPCIColor(pci: number): string {
   if (pci >= 10) return '#dc2626'; // Red - Serious
   return '#991b1b'; // Dark red - Failed
 }
+
+export function getRoughnessColor(percentileRank: number): string {
+  if (percentileRank < 25) return '#16a34a'; // green  - smoothest 0–25%
+  if (percentileRank < 50) return '#facc15'; // yellow - 25–50%
+  if (percentileRank < 75) return '#f97316'; // orange - 50–75%
+  return '#dc2626';                          // red    - roughest 75–100%
+}

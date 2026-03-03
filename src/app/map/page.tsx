@@ -77,6 +77,26 @@ interface FrameDamageMapping {
   frames: Record<string, FrameDamageEntry>;
 }
 
+interface RoughnessSample {
+  latitude: number;
+  longitude: number;
+  roughness_normalized: number;
+}
+
+interface RoughnessMapping {
+  jobId: string;
+  jobPrefix: string;
+  samples: RoughnessSample[];
+}
+
+interface RoughnessSegment {
+  coords: [number, number][]; // [lat, lon] pairs
+  roughness_median: number;
+  percentile_rank: number; // 0–100, computed across all segments
+  sample_count: number;
+  jobId: string;
+}
+
 const DEFAULT_TARGET_CONFIG: S3TargetConfig = {
   prefix: DEFAULT_RESULTS_PREFIX,
   mode: 'data',
@@ -1441,6 +1461,14 @@ function calculateHorizontalOffset(
  * @param geojson - GeoJSON FeatureCollection with LineString segments
  * @returns Array of individual crack data with offset coordinates
  */
+function haversineDistanceM(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 function extractIndividualCracks(geojson: any): CrackDotData[] {
   if (!geojson?.features || !Array.isArray(geojson.features)) {
     console.warn('[extractCracks] No features in geojson');
@@ -1448,6 +1476,7 @@ function extractIndividualCracks(geojson: any): CrackDotData[] {
   }
 
   const cracks: CrackDotData[] = [];
+  const seenDefectIds = new Set<string>();
   let processedCount = 0;
   let skippedCount = 0;
 
@@ -1473,6 +1502,10 @@ function extractIndividualCracks(geojson: any): CrackDotData[] {
           skippedCount++;
           return;
         }
+
+        // Skip duplicate defect_ids (same physical defect in multiple overlapping tracks)
+        if (seenDefectIds.has(defect.defect_id)) return;
+        seenDefectIds.add(defect.defect_id);
 
         if (!defect.gps_coordinates?.latitude || !defect.gps_coordinates?.longitude) {
           console.warn(`[extractCracks] Skipping defect ${defect.defect_id} - missing GPS`);
@@ -1552,6 +1585,7 @@ function MapPageContent() {
   const [jobVideoSegments, setJobVideoSegments] = useState<Record<string, JobVideoSegmentsEntry>>({});
   const [gpsFrameMappings, setGpsFrameMappings] = useState<Record<string, GpsFrameMappingEntry>>({});
   const [frameDamageMappings, setFrameDamageMappings] = useState<Record<string, FrameDamageMapping>>({});
+  const [roughnessMappings, setRoughnessMappings] = useState<Record<string, RoughnessMapping>>({});
   const [rawParentTrackFeatures, setRawParentTrackFeatures] = useState<any[]>([]);
   const [segmentLengthFeet, setSegmentLengthFeet] = useState(528);
   const [customSegmentInput, setCustomSegmentInput] = useState('');
@@ -1624,6 +1658,58 @@ function MapPageContent() {
     }),
     [crackDotsData, activeDefectTypes, minSizePercentile, sizeThresholdByType]
   );
+
+  const roughnessSegments = useMemo((): RoughnessSegment[] => {
+    const segmentLengthM = segmentLengthFeet * 0.3048;
+    // Build segments without percentile_rank first
+    const raw: Omit<RoughnessSegment, 'percentile_rank'>[] = [];
+
+    for (const mapping of Object.values(roughnessMappings)) {
+      if (mapping.samples.length === 0) continue;
+      let currentCoords: [number, number][] = [];
+      let currentValues: number[] = [];
+      let accumulatedDist = 0;
+      let prev: RoughnessSample | null = null;
+
+      const flush = () => {
+        if (currentCoords.length >= 2) {
+          const sorted = [...currentValues].sort((a, b) => a - b);
+          raw.push({
+            coords: currentCoords,
+            roughness_median: sorted[Math.floor(sorted.length / 2)],
+            sample_count: currentCoords.length,
+            jobId: mapping.jobId,
+          });
+        }
+      };
+
+      for (const s of mapping.samples) {
+        if (prev) {
+          accumulatedDist += haversineDistanceM(prev.latitude, prev.longitude, s.latitude, s.longitude);
+        }
+        currentCoords.push([s.latitude, s.longitude]);
+        currentValues.push(s.roughness_normalized);
+        if (accumulatedDist >= segmentLengthM) {
+          flush();
+          currentCoords = [[s.latitude, s.longitude]];
+          currentValues = [s.roughness_normalized];
+          accumulatedDist = 0;
+        }
+        prev = s;
+      }
+      flush();
+    }
+
+    if (raw.length === 0) return [];
+
+    // Compute percentile rank for each segment across all segments
+    const sortedMedians = [...raw.map(s => s.roughness_median)].sort((a, b) => a - b);
+    return raw.map(seg => ({
+      ...seg,
+      percentile_rank: (sortedMedians.filter(v => v <= seg.roughness_median).length / sortedMedians.length) * 100,
+    }));
+  }, [roughnessMappings, segmentLengthFeet]);
+
   const videoSegmentJobKeys = useMemo(() => Object.keys(jobVideoSegments), [jobVideoSegments]);
   const selectedTrackGroupJobIds = useMemo(
     () => deriveJobIdsFromTrackGroup(selectedTrackGroupForVideo),
@@ -2052,6 +2138,23 @@ function MapPageContent() {
     return sortedFrames;
   };
 
+  const parseRoughnessCsv = (csvText: string): RoughnessSample[] => {
+    const lines = csvText.trim().split('\n');
+    if (lines.length < 2) return [];
+    const samples: RoughnessSample[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(',');
+      if (cols.length < 10) continue;
+      if (parseInt(cols[9], 10) !== 1) continue; // is_valid filter
+      const lat = parseFloat(cols[2]);
+      const lon = parseFloat(cols[3]);
+      const roughness = parseFloat(cols[6]);
+      if (!isFinite(lat) || !isFinite(lon) || !isFinite(roughness)) continue;
+      samples.push({ latitude: lat, longitude: lon, roughness_normalized: roughness });
+    }
+    return samples;
+  };
+
   const loadGpsFrameMappingsForJobPrefixes = async (jobPrefixes: string[]): Promise<Record<string, GpsFrameMappingEntry>> => {
     if (!Array.isArray(jobPrefixes) || jobPrefixes.length === 0) {
       return {};
@@ -2108,6 +2211,31 @@ function MapPageContent() {
         }
       } catch (err) {
         console.warn(`No frame damage mapping for ${normalized}`, err);
+      }
+    }));
+    return entries;
+  };
+
+  const loadRoughnessMappingsForJobPrefixes = async (
+    jobPrefixes: string[]
+  ): Promise<Record<string, RoughnessMapping>> => {
+    if (!Array.isArray(jobPrefixes) || jobPrefixes.length === 0) return {};
+    const entries: Record<string, RoughnessMapping> = {};
+    await Promise.all(jobPrefixes.map(async jobPrefix => {
+      const normalized = ensureTrailingSlash(jobPrefix);
+      const jobId = deriveJobIdFromPrefix(normalized);
+      const url = `${S3_HTTP_BASE_URL}/${normalized}data/gps_roughness_mapping.csv`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const csvText = await res.text();
+        const samples = parseRoughnessCsv(csvText);
+        if (samples.length > 0) {
+          entries[jobId] = { jobId, jobPrefix: normalized, samples };
+          console.log(`[map] Loaded ${samples.length} roughness samples for job ${jobId}`);
+        }
+      } catch (err) {
+        console.warn(`No roughness mapping for ${normalized}`, err);
       }
     }));
     return entries;
@@ -2181,6 +2309,7 @@ function MapPageContent() {
     setJobVideoSegments({});
     setGpsFrameMappings({});
     setFrameDamageMappings({});
+    setRoughnessMappings({});
     setRawParentTrackFeatures([]);
     setSegmentLengthFeet(528);
     setCustomSegmentInput('');
@@ -2206,6 +2335,7 @@ function MapPageContent() {
       const videoSegmentsPromise = loadVideoSegmentsForJobPrefixes(jobPrefixes);
       const gpsFrameMappingsPromise = loadGpsFrameMappingsForJobPrefixes(jobPrefixes);
       const frameDamageMappingsPromise = loadFrameDamageMappingsForJobPrefixes(jobPrefixes);
+      const roughnessMappingsPromise = loadRoughnessMappingsForJobPrefixes(jobPrefixes);
 
       const fetchPromises = geojsonUrls.map(async (geojsonUrl, index) => {
         try {
@@ -2236,17 +2366,20 @@ function MapPageContent() {
       });
 
       await Promise.allSettled(fetchPromises);
-      const [loadedVideoSegments, loadedGpsFrameMappings, loadedFrameDamageMappings] = await Promise.all([
+      const [loadedVideoSegments, loadedGpsFrameMappings, loadedFrameDamageMappings, loadedRoughnessMappings] = await Promise.all([
         videoSegmentsPromise,
         gpsFrameMappingsPromise,
         frameDamageMappingsPromise,
+        roughnessMappingsPromise,
       ]);
       setJobVideoSegments(loadedVideoSegments);
       setGpsFrameMappings(loadedGpsFrameMappings);
       setFrameDamageMappings(loadedFrameDamageMappings);
+      setRoughnessMappings(loadedRoughnessMappings);
       console.log(`[map] Loaded video segments for ${Object.keys(loadedVideoSegments).length} job(s).`);
       console.log(`[map] Loaded GPS frame mappings for ${Object.keys(loadedGpsFrameMappings).length} job(s).`);
       console.log(`[map] Loaded frame damage mappings for ${Object.keys(loadedFrameDamageMappings).length} job(s).`);
+      console.log(`[map] Loaded roughness mappings for ${Object.keys(loadedRoughnessMappings).length} job(s).`);
 
       if (isParentTrackDataset(allFeatures)) {
         setRawParentTrackFeatures(allFeatures);
@@ -2411,41 +2544,48 @@ function MapPageContent() {
                 {loading ? 'Loading...' : 'Load Maps'}
               </button>
 
-              {/* View mode toggle button */}
-              {geojson && crackDotsData.length > 0 && (
-                <button
-                  onClick={() => setMapViewMode(mode => mode === 'segments' ? 'cracks' : 'segments')}
-                  style={{
-                    background: mapViewMode === 'cracks' ? '#8b5cf6' : '#6b7280',
-                    color: 'white',
-                    fontWeight: '600',
-                    padding: '0.5rem 1rem',
-                    borderRadius: '8px',
-                    border: 'none',
-                    cursor: 'pointer',
-                    transition: 'all 0.15s ease-in-out',
-                    fontSize: '0.9rem',
-                    minWidth: '150px',
-                    height: '40px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: '0.5rem'
-                  }}
-                  onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.9'; }}
-                  onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
-                >
-                  <span style={{ fontSize: '1.1rem' }}>
-                    {mapViewMode === 'cracks' ? '🔴' : '🛣️'}
-                  </span>
-                  <span>
-                    {mapViewMode === 'cracks' ? 'Defect Points' : 'Road Segments'}
-                  </span>
-                </button>
+              {/* View mode segmented control */}
+              {geojson && (
+                <div style={{
+                  display: 'flex',
+                  border: '1.5px solid #d1d5db',
+                  borderRadius: '8px',
+                  overflow: 'hidden',
+                  height: '40px',
+                }}>
+                  {([
+                    ['segments', '🛣️', 'Segments'],
+                    ['cracks',   '🔴', 'Defects'],
+                    ['roughness','〰️', 'Roughness'],
+                  ] as [MapViewMode, string, string][]).map(([mode, icon, label], i, arr) => (
+                    <button
+                      key={mode}
+                      onClick={() => setMapViewMode(mode)}
+                      style={{
+                        background: mapViewMode === mode ? '#2563eb' : '#fff',
+                        color: mapViewMode === mode ? '#fff' : '#374151',
+                        border: 'none',
+                        borderRight: i < arr.length - 1 ? '1.5px solid #d1d5db' : 'none',
+                        padding: '0 0.85rem',
+                        fontSize: '0.875rem',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.35rem',
+                        transition: 'background 0.15s, color 0.15s',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      <span>{icon}</span>
+                      <span>{label}</span>
+                    </button>
+                  ))}
+                </div>
               )}
 
-              {/* Segment size controls — shown in segments view when data is loaded */}
-              {geojson && mapViewMode === 'segments' && (
+              {/* Segment size controls — shown in segments and roughness views */}
+              {geojson && (mapViewMode === 'segments' || mapViewMode === 'roughness') && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
                   <span style={{ fontSize: '0.8rem', color: '#6b7280', fontWeight: 500 }}>Segment:</span>
                   {([['0.1 mi', 528], ['0.5 mi', 2640], ['1 mi', 5280]] as [string, number][]).map(([label, val]) => (
@@ -2466,31 +2606,41 @@ function MapPageContent() {
                       {label}
                     </button>
                   ))}
-                  <input
-                    type="number"
-                    min="1"
-                    placeholder="Custom ft"
-                    value={customSegmentInput}
-                    onChange={e => setCustomSegmentInput(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') {
+                  <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
+                    <input
+                      type="number"
+                      min="1"
+                      placeholder="Custom"
+                      value={customSegmentInput}
+                      onChange={e => setCustomSegmentInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          const val = parseInt(customSegmentInput, 10);
+                          if (val > 0) setSegmentLengthFeet(val);
+                        }
+                      }}
+                      onBlur={() => {
                         const val = parseInt(customSegmentInput, 10);
                         if (val > 0) setSegmentLengthFeet(val);
-                      }
-                    }}
-                    onBlur={() => {
-                      const val = parseInt(customSegmentInput, 10);
-                      if (val > 0) setSegmentLengthFeet(val);
-                    }}
-                    style={{
-                      width: '90px',
-                      padding: '0.25rem 0.5rem',
-                      border: '1px solid #d1d5db',
-                      borderRadius: '6px',
-                      fontSize: '0.8rem',
-                      outline: 'none',
-                    }}
-                  />
+                      }}
+                      style={{
+                        width: '90px',
+                        padding: '0.25rem 2rem 0.25rem 0.5rem',
+                        border: '1px solid #d1d5db',
+                        borderRadius: '6px',
+                        fontSize: '0.8rem',
+                        outline: 'none',
+                      }}
+                    />
+                    <span style={{
+                      position: 'absolute',
+                      right: '0.4rem',
+                      fontSize: '0.75rem',
+                      color: '#9ca3af',
+                      pointerEvents: 'none',
+                      userSelect: 'none',
+                    }}>ft</span>
+                  </div>
                 </div>
               )}
 
@@ -2559,7 +2709,11 @@ function MapPageContent() {
               )}
 
               {/* Show defect count */}
-              {crackDotsData.length > 0 && (
+              {mapViewMode === 'roughness' && roughnessSegments.length > 0 ? (
+                <span style={{ color: '#6b7280', fontSize: '0.9rem', fontWeight: '500' }}>
+                  {roughnessSegments.length.toLocaleString()} roughness segments
+                </span>
+              ) : crackDotsData.length > 0 && mapViewMode !== 'roughness' && (
                 <span style={{ color: '#6b7280', fontSize: '0.9rem', fontWeight: '500' }}>
                   {mapViewMode === 'cracks'
                     ? `${filteredCrackDotsData.length.toLocaleString()} / ${crackDotsData.length.toLocaleString()} defects`
@@ -2741,6 +2895,7 @@ function MapPageContent() {
             viewMode={mapViewMode}
             crackDotsData={filteredCrackDotsData}
             frameDamageMappings={frameDamageMappings}
+            roughnessSegments={roughnessSegments}
           />
         </div>
       </div>
