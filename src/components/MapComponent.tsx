@@ -46,6 +46,7 @@ interface MapComponentProps {
   onSegmentSelected?: (segment: any | null) => void;
   viewMode?: MapViewMode; // View mode: 'segments' or 'cracks'
   crackDotsData?: CrackDotData[]; // Individual crack data for crack dots view
+  frameDamageMappings?: Record<string, any>; // keyed by jobId, has .frames[frameId].lane_pixels
 }
 
 interface ClusterData {
@@ -90,6 +91,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
   onSegmentSelected,
   viewMode = 'segments', // Default to segments view
   crackDotsData = [],    // Default to empty array
+  frameDamageMappings,
 }) => {
   const mapRef = useRef<L.Map>(null);
   const clusterGroupRef = useRef<L.MarkerClusterGroup | null>(null);
@@ -183,7 +185,7 @@ const MapComponent: React.FC<MapComponentProps> = ({
           const clampEnd = Math.min(segmentEnd, span.end_feet || 0);
           const lengthFt = span.measured_length_feet ?? (Number.isFinite(clampStart) && Number.isFinite(clampEnd) ? Math.max(0, clampEnd - clampStart) : null);
           const lengthLabel = lengthFt ? `${lengthFt.toFixed(1)}ft` : 'N/A';
-          return `<div class="thumb-card"><img src="${u}" alt="thumb-${ti}" class="thumb-full" /><div class="thumb-caption">Defects: ${damageType} · Severity: ${severityLabel} · Length: ${lengthLabel}</div></div>`;
+          return `<div class="thumb-card"><img src="${u}" alt="thumb-${ti}" class="thumb-full" /><div class="thumb-caption">Defects: ${damageType} · Length: ${lengthLabel}</div></div>`;
         })
         .join('');
 
@@ -246,6 +248,11 @@ const MapComponent: React.FC<MapComponentProps> = ({
   // Removed internal isSidebarOpen, screenSize states as they are now props
   const [currentZoom, setCurrentZoom] = useState(13);
   const [hoveredDefect, setHoveredDefect] = useState<CrackDotData | null>(null);
+  const [selectedDefect, setSelectedDefect] = useState<CrackDotData | null>(null);
+  const [hoveredHighQualityUrl, setHoveredHighQualityUrl] = useState<string | null>(null);
+  const hoverGenRef = useRef(0);
+  const pendingHQRef = useRef<HTMLImageElement | null>(null);
+  const hqCacheRef = useRef<Set<string>>(new Set());
 
   const sortedSidebarFrames = useMemo(() => {
     if (!selectedCluster?.markers) {
@@ -765,78 +772,55 @@ const MapComponent: React.FC<MapComponentProps> = ({
     // Add hover handlers to show preview panel (skip for cluster markers)
     if (!isForCluster) {
       marker.on('mouseover', () => {
+        // Cancel any in-flight HQ request — frees the connection
+        if (pendingHQRef.current) {
+          pendingHQRef.current.onload = null;
+          pendingHQRef.current.src = '';
+          pendingHQRef.current = null;
+        }
+
+        const gen = ++hoverGenRef.current;
+        const hqUrl = crack.images?.polygon_overlay;
+
+        // If HQ already cached, show it immediately — no thumbnail flash
+        if (hqUrl && hqCacheRef.current.has(hqUrl)) {
+          setHoveredHighQualityUrl(hqUrl);
+          setHoveredDefect(crack);
+          return;
+        }
+
+        // Not cached: show thumbnail first, upgrade to HQ when loaded
+        setHoveredHighQualityUrl(null);
         setHoveredDefect(crack);
+
+        if (hqUrl) {
+          const img = new Image();
+          pendingHQRef.current = img;
+          img.onload = () => {
+            pendingHQRef.current = null;
+            hqCacheRef.current.add(hqUrl);
+            if (hoverGenRef.current === gen) {
+              setHoveredHighQualityUrl(hqUrl);
+            }
+          };
+          img.src = hqUrl;
+        }
       });
 
       marker.on('mouseout', () => {
+        if (pendingHQRef.current) {
+          pendingHQRef.current.onload = null;
+          pendingHQRef.current.src = '';
+          pendingHQRef.current = null;
+        }
+        hoverGenRef.current++;
         setHoveredDefect(null);
+        setHoveredHighQualityUrl(null);
       });
     }
 
-    // Click popup with full details
-    let popupContent = `
-      <div style="max-width: 330px; font-family: 'Inter', sans-serif; font-size: 0.9em;">
-        <h3 style="margin: 0 0 10px 0; color: #333; font-size: 1.1em;">Crack Detection</h3>
-        <p style="margin: 4px 0;"><strong>Type:</strong> <span style="text-transform: capitalize;">${crack.defect_type}</span></p>
-        <p style="margin: 4px 0;"><strong>Severity:</strong> ${crack.severity}</p>
-        <p style="margin: 4px 0;"><strong>ID:</strong> <code style="font-size: 0.85em;">${crack.defect_id}</code></p>
-        <p style="margin: 4px 0;"><strong>GPS:</strong> ${crack.gps_coordinates.latitude.toFixed(6)}, ${crack.gps_coordinates.longitude.toFixed(6)}</p>
-    `;
-
-    // Add measurements if available
-    if (crack.measurements) {
-      popupContent += `<hr style="margin: 8px 0; border: none; border-top: 1px solid #e5e7eb;" />`;
-      popupContent += `<p style="margin: 4px 0; font-size: 0.9em; color: #666;"><strong>Measurements:</strong></p>`;
-
-      if (crack.measurements.area_px) {
-        popupContent += `<p style="margin: 2px 0 2px 12px; font-size: 0.85em;">Area: ${crack.measurements.area_px.toFixed(0)} px²</p>`;
-      }
-      if (crack.measurements.length_px) {
-        popupContent += `<p style="margin: 2px 0 2px 12px; font-size: 0.85em;">Length: ${crack.measurements.length_px.toFixed(0)} px</p>`;
-      }
-      if (crack.measurements.width_px) {
-        popupContent += `<p style="margin: 2px 0 2px 12px; font-size: 0.85em;">Width: ${crack.measurements.width_px.toFixed(0)} px</p>`;
-      }
-    }
-
-    // Add segment/job info
-    if (crack.parent_segment_id || crack.job_id) {
-      popupContent += `<hr style="margin: 8px 0; border: none; border-top: 1px solid #e5e7eb;" />`;
-      if (crack.parent_segment_id) {
-        popupContent += `<p style="margin: 2px 0; font-size: 0.85em; color: #666;">Segment: ${crack.parent_segment_id}</p>`;
-      }
-      if (crack.job_id) {
-        popupContent += `<p style="margin: 2px 0; font-size: 0.85em; color: #666;">Job: ${crack.job_id}</p>`;
-      }
-      if (crack.frame_id) {
-        popupContent += `<p style="margin: 2px 0; font-size: 0.85em; color: #666;">Frame: ${crack.frame_id}</p>`;
-      }
-    }
-
-    // Add image if available
-    const popupImage = crack.images?.polygon_overlay || crack.images?.thumbnail;
-    if (popupImage) {
-      popupContent += `
-        <img src="${popupImage}" alt="Crack detail"
-             style="max-width: 100%; height: auto; border-radius: 6px;
-                    margin-top: 10px; max-height: 250px; object-fit: contain;
-                    border: 1px solid #e5e7eb;"
-             loading="lazy" />
-      `;
-    }
-
-    popupContent += `</div>`;
-
-    marker.bindPopup(popupContent, {
-      maxWidth: 340,
-      autoClose: false,
-      closeOnClick: false,
-      className: 'custom-click-popup',
-      offset: L.point(0, -10)
-    });
-
     marker.on('click', function () {
-      marker.openPopup();
+      setSelectedDefect(crack);
     });
 
     return marker;
@@ -1317,56 +1301,94 @@ const MapComponent: React.FC<MapComponentProps> = ({
       )}
 
       {/* Fixed preview panel for defect points */}
-      {hoveredDefect && (
-        <div style={{
-          position: 'absolute',
-          right: '20px',
-          top: '50%',
-          transform: 'translateY(-50%)',
-          background: 'rgba(255, 255, 255, 0.95)',
-          padding: '16px',
-          borderRadius: '8px',
-          boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-          zIndex: 1001,
-          maxWidth: '50vw',
-          maxHeight: '80vh',
-          overflow: 'auto',
-          fontFamily: 'Inter, sans-serif'
-        }}>
-          <div style={{ marginBottom: '12px' }}>
-            <h3 style={{ margin: '0 0 8px 0', fontSize: '1.1em', color: '#333', textTransform: 'capitalize' }}>
-              {hoveredDefect.defect_type}
-            </h3>
-            <p style={{ margin: '4px 0', fontSize: '0.9em', color: '#666' }}>
-              <strong>Severity:</strong> {hoveredDefect.severity}
-            </p>
-            <p style={{ margin: '4px 0', fontSize: '0.85em', color: '#999' }}>
-              ID: {hoveredDefect.defect_id}
-            </p>
+      {(selectedDefect || hoveredDefect) && (() => {
+        // Hover always takes priority over pinned — show hovered defect's thumbnail.
+        // When nothing is hovered, show the pinned defect's polygon_overlay.
+        const isPinned = !!selectedDefect && !hoveredDefect;
+        const defect = hoveredDefect || selectedDefect!;
+        const image = isPinned
+          ? (defect.images?.polygon_overlay || defect.images?.thumbnail)
+          : (hoveredHighQualityUrl || defect.images?.thumbnail || defect.images?.polygon_overlay);
+        return (
+          <div style={{
+            position: 'absolute',
+            right: '20px',
+            top: '50%',
+            transform: 'translateY(-50%)',
+            background: 'rgba(255, 255, 255, 0.95)',
+            padding: '16px',
+            borderRadius: '8px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            zIndex: 1001,
+            width: '33%',
+            maxHeight: '80vh',
+            overflow: 'auto',
+            fontFamily: 'Inter, sans-serif',
+            fontSize: '0.9em',
+          }}>
+            {/* Header */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '10px' }}>
+              <h3 style={{ margin: 0, fontSize: '1.1em', color: '#333', textTransform: 'capitalize' }}>
+                {defect.defect_type}
+              </h3>
+              {isPinned && (
+                <button
+                  onClick={() => setSelectedDefect(null)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '1.3em', color: '#6b7280', lineHeight: 1, padding: '0 0 0 8px' }}
+                  title="Close"
+                >×</button>
+              )}
+            </div>
+
+            {/* Image — crop to 16:9 to eliminate letterbox black bars in square thumbnails */}
+            {image && (
+              <img
+                src={image}
+                alt="Defect"
+                style={{ width: '100%', aspectRatio: '16/9', objectFit: 'cover', borderRadius: '6px', border: '1px solid #e5e7eb', display: 'block', marginBottom: '10px' }}
+                loading="lazy"
+              />
+            )}
+
+            {/* Details */}
+            {(() => {
+              const frameEntry = frameDamageMappings?.[defect.job_id!]?.frames?.[String(defect.frame_id)];
+              const lanePixels: number | undefined = frameEntry?.lane_pixels;
+              // Estimate lane width in pixels: lane area / frame height (4K = 2160px tall)
+              const laneWidthPx = lanePixels ? lanePixels / 2160 : undefined;
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '3px', color: '#555' }}>
+                  <div><strong>GPS:</strong> {defect.gps_coordinates.latitude.toFixed(6)}, {defect.gps_coordinates.longitude.toFixed(6)}</div>
+                  {defect.measurements && lanePixels != null && laneWidthPx != null && (
+                    <>
+                      {defect.measurements.area_px != null && (
+                        <div><strong>Coverage:</strong> {(defect.measurements.area_px / lanePixels * 100).toFixed(2)}% of lane</div>
+                      )}
+                      {defect.measurements.width_px != null && (
+                        <div><strong>Width:</strong> {(defect.measurements.width_px / laneWidthPx * 100).toFixed(1)}% of lane</div>
+                      )}
+                      {defect.measurements.length_px != null && (
+                        <div><strong>Length:</strong> {(defect.measurements.length_px / laneWidthPx * 100).toFixed(1)}% of lane</div>
+                      )}
+                    </>
+                  )}
+                  {defect.measurements && lanePixels == null && (
+                    <>
+                      {defect.measurements.area_px != null && <div><strong>Area:</strong> {defect.measurements.area_px.toFixed(0)} px²</div>}
+                      {defect.measurements.length_px != null && <div><strong>Length:</strong> {defect.measurements.length_px.toFixed(0)} px</div>}
+                      {defect.measurements.width_px != null && <div><strong>Width:</strong> {defect.measurements.width_px.toFixed(0)} px</div>}
+                    </>
+                  )}
+                  {defect.parent_segment_id != null && <div><strong>Segment:</strong> {defect.parent_segment_id}</div>}
+                  {defect.job_id && <div><strong>Job:</strong> {defect.job_id}</div>}
+                  {defect.frame_id != null && <div><strong>Frame:</strong> {defect.frame_id}</div>}
+                  <div style={{ color: '#aaa', fontSize: '0.8em', marginTop: '4px' }}>{defect.defect_id}</div>
+                </div>
+              );
+            })()}
           </div>
-          {(hoveredDefect.images?.thumbnail || hoveredDefect.images?.polygon_overlay || hoveredDefect.images?.measurement_overlay) ? (
-            <img
-              src={hoveredDefect.images?.thumbnail || hoveredDefect.images?.polygon_overlay || hoveredDefect.images?.measurement_overlay}
-              alt="Defect preview"
-              style={{
-                width: '100%',
-                minWidth: '30vw',
-                height: 'auto',
-                minHeight: '30vh',
-                borderRadius: '6px',
-                maxHeight: '70vh',
-                objectFit: 'contain',
-                border: '1px solid #e5e7eb'
-              }}
-              loading="lazy"
-            />
-          ) : (
-            <p style={{ color: '#999', fontSize: '0.9em', textAlign: 'center', padding: '20px' }}>
-              No image preview available
-            </p>
-          )}
-        </div>
-      )}
+        );
+      })()}
 
       {/* Visualization mode toggle */}
       <div style={{

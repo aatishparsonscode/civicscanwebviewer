@@ -63,6 +63,20 @@ interface GpsFrameMappingEntry {
   frames: GpsFrameEntry[];
 }
 
+interface FrameDamageEntry {
+  distance_m: number;
+  distance_ft: number;
+  lane_pixels: number;
+  detection_pixels: Record<string, number>;
+  projection_pixels: Record<string, number>;
+}
+
+interface FrameDamageMapping {
+  jobId: string;
+  jobPrefix: string;
+  frames: Record<string, FrameDamageEntry>;
+}
+
 const DEFAULT_TARGET_CONFIG: S3TargetConfig = {
   prefix: DEFAULT_RESULTS_PREFIX,
   mode: 'data',
@@ -682,28 +696,61 @@ const buildDefectImageUrls = (images: any = {}) => {
   return { thumbnail, annotated, original, measurement };
 };
 
+const FRAME_DAMAGE_DEFECT_TYPES = ['transverse', 'alligator', 'pothole', 'sealed_crack', 'longitudinal'];
+
+function computePciFromFrameData(
+  frameData: Record<string, FrameDamageEntry>,
+  segStartFt: number,
+  segEndFt: number,
+  segmentLabel: string
+): { pciResult: PCIResult; pixelPercentages: PixelPercentageData } {
+  let totalLanePx = 0;
+  const sumProjectionPx: Record<string, number> = {};
+  for (const frame of Object.values(frameData)) {
+    if (frame.distance_ft >= segStartFt && frame.distance_ft < segEndFt) {
+      totalLanePx += frame.lane_pixels;
+      for (const type of FRAME_DAMAGE_DEFECT_TYPES) {
+        sumProjectionPx[type] = (sumProjectionPx[type] ?? 0) + (frame.projection_pixels[type] ?? 0);
+      }
+    }
+  }
+  const pixelPercentages: PixelPercentageData = {};
+  if (totalLanePx > 0) {
+    for (const type of FRAME_DAMAGE_DEFECT_TYPES) {
+      (pixelPercentages as any)[type] = ((sumProjectionPx[type] ?? 0) / totalLanePx) * 100;
+    }
+    const pp = pixelPercentages as any;
+    pp.total = FRAME_DAMAGE_DEFECT_TYPES.reduce((s, t) => s + (pp[t] ?? 0), 0);
+  }
+  return { pciResult: calculatePCI(pixelPercentages, { verbose: false, segmentId: segmentLabel }), pixelPercentages };
+}
+
 const convertParentTracksToFeatures = (
   features: any[],
   gpsFrameMappings?: Record<string, GpsFrameMappingEntry>,
-  videoSegments?: Record<string, JobVideoSegmentsEntry>
+  videoSegments?: Record<string, JobVideoSegmentsEntry>,
+  frameDamageData?: Record<string, FrameDamageMapping>,
+  segmentLengthFeet: number = 528
 ) => {
   const segments: any[] = [];
   const METERS_TO_FEET = 3.28084;
-  const SEGMENT_LENGTH_FEET = 528; // 0.1 mile
+  const SEGMENT_LENGTH_FEET = segmentLengthFeet;
 
   // Build a map of frame_id -> segment_id based on GPS coordinates
-  const buildFrameToSegmentMap = (frames: GpsFrameEntry[]): { frameToSegment: Map<number, number>; segmentCoords: Map<number, { start: [number, number]; end: [number, number] }> } => {
+  const buildFrameToSegmentMap = (frames: GpsFrameEntry[]): { frameToSegment: Map<number, number>; segmentCoords: Map<number, { start: [number, number]; end: [number, number]; coords: [number, number][] }> } => {
     const frameToSegment = new Map<number, number>();
-    const segmentCoords = new Map<number, { start: [number, number]; end: [number, number] }>();
+    const segmentCoords = new Map<number, { start: [number, number]; end: [number, number]; coords: [number, number][] }>();
 
     if (frames.length < 2) {
-      frames.forEach((frame, idx) => {
+      frames.forEach((frame) => {
         frameToSegment.set(frame.frame_id, 0);
       });
       if (frames.length > 0) {
+        const coords: [number, number][] = frames.map(f => [f.longitude, f.latitude]);
         segmentCoords.set(0, {
           start: [frames[0].longitude, frames[0].latitude],
           end: [frames[frames.length - 1].longitude, frames[frames.length - 1].latitude],
+          coords,
         });
       }
       return { frameToSegment, segmentCoords };
@@ -739,14 +786,16 @@ const convertParentTracksToFeatures = (
       segmentFrames.get(segmentId)!.push(frame);
     });
 
-    // Build segment start/end coordinates
+    // Build segment coordinates (all frames in order)
     segmentFrames.forEach((framesInSegment, segmentId) => {
       if (framesInSegment.length > 0) {
         const firstFrame = framesInSegment[0];
         const lastFrame = framesInSegment[framesInSegment.length - 1];
+        const coords: [number, number][] = framesInSegment.map(f => [f.longitude, f.latitude]);
         segmentCoords.set(segmentId, {
           start: [firstFrame.longitude, firstFrame.latitude],
           end: [lastFrame.longitude, lastFrame.latitude],
+          coords,
         });
       }
     });
@@ -931,7 +980,7 @@ const convertParentTracksToFeatures = (
   });
 
   // Build frame-to-segment mappings for each job
-  const jobFrameToSegment = new Map<string, { frameToSegment: Map<number, number>; segmentCoords: Map<number, { start: [number, number]; end: [number, number] }> }>();
+  const jobFrameToSegment = new Map<string, { frameToSegment: Map<number, number>; segmentCoords: Map<number, { start: [number, number]; end: [number, number]; coords: [number, number][] }> }>();
 
   if (gpsFrameMappings && Object.keys(gpsFrameMappings).length > 0) {
     Object.entries(gpsFrameMappings).forEach(([jobId, entry]) => {
@@ -1059,7 +1108,7 @@ const convertParentTracksToFeatures = (
     if (segmentCoords) {
       geometry = {
         type: 'LineString',
-        coordinates: [segmentCoords.start, segmentCoords.end],
+        coordinates: segmentCoords.coords.length >= 2 ? segmentCoords.coords : [segmentCoords.start, segmentCoords.end],
       };
     } else if (data.tracks.length > 0) {
       // Fallback: use coordinates from first track
@@ -1079,19 +1128,17 @@ const convertParentTracksToFeatures = (
     const startCoord = geometry.coordinates[0];
     const endCoord = geometry.coordinates[geometry.coordinates.length - 1];
 
-    // Find matching segment in segments_index.json to get pixel percentage data
+    // Calculate PCI — use segments_index.json for default 528ft, frame data otherwise
     let pixelData: any = {};
     let pixelPercentages: PixelPercentageData = {};
+    let pciResult: PCIResult;
 
-    if (videoSegments && videoSegments[jobId]?.segmentsIndex?.segments) {
+    if (SEGMENT_LENGTH_FEET === 528 && videoSegments && videoSegments[jobId]?.segmentsIndex?.segments) {
       const matchingSegment = videoSegments[jobId].segmentsIndex.segments.find(
         (seg: any) => seg.segment_id === (segmentId + 1) // segment_id in JSON is 1-indexed
       );
       if (matchingSegment) {
-        // Extract pixel percentages for PCI calculation
         pixelPercentages = matchingSegment.pixel_percentage_with_projections || {};
-
-        // Store full pixel data for segment properties
         pixelData = {
           pixel_percentage_with_projections: matchingSegment.pixel_percentage_with_projections,
           total_defect_percentage_with_projections: matchingSegment.total_defect_percentage_with_projections,
@@ -1103,13 +1150,25 @@ const convertParentTracksToFeatures = (
       } else {
         console.warn(`No segment data found for segment ${segmentId} (Job: ${jobId})`);
       }
+      pciResult = calculatePCI(pixelPercentages, { verbose: false, segmentId: `${segmentId} (Job: ${jobId})` });
+    } else {
+      // Non-default segment size: compute PCI from per-frame damage pixel data
+      const frameData = frameDamageData?.[jobId]?.frames ?? {};
+      const segStartFt = segmentId * SEGMENT_LENGTH_FEET;
+      const segEndFt = (segmentId + 1) * SEGMENT_LENGTH_FEET;
+      const computed = computePciFromFrameData(frameData, segStartFt, segEndFt, `${segmentId} (Job: ${jobId})`);
+      pciResult = computed.pciResult;
+      // Populate pixelData so tooltip coverage values display correctly
+      const pp = computed.pixelPercentages as any;
+      const totalDefect = (pp.transverse ?? 0) + (pp.alligator ?? 0) + (pp.pothole ?? 0) + (pp.longitudinal ?? 0);
+      pixelData = {
+        pixel_percentage_with_projections: computed.pixelPercentages,
+        total_defect_percentage_with_projections: totalDefect,
+        total_sealed_percentage_with_projections: pp.sealed_crack ?? 0,
+        total_defect_percentage: totalDefect,
+        total_sealed_percentage: pp.sealed_crack ?? 0,
+      };
     }
-
-    // Calculate PCI using pixel-based formula
-    const pciResult = calculatePCI(pixelPercentages, {
-      verbose: false, // Set to true for detailed per-segment logging
-      segmentId: `${segmentId} (Job: ${jobId})`
-    });
     segmentsProcessed++;
 
     segments.push({
@@ -1492,6 +1551,10 @@ function MapPageContent() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [jobVideoSegments, setJobVideoSegments] = useState<Record<string, JobVideoSegmentsEntry>>({});
   const [gpsFrameMappings, setGpsFrameMappings] = useState<Record<string, GpsFrameMappingEntry>>({});
+  const [frameDamageMappings, setFrameDamageMappings] = useState<Record<string, FrameDamageMapping>>({});
+  const [rawParentTrackFeatures, setRawParentTrackFeatures] = useState<any[]>([]);
+  const [segmentLengthFeet, setSegmentLengthFeet] = useState(528);
+  const [customSegmentInput, setCustomSegmentInput] = useState('');
   const [selectedTrackGroupForVideo, setSelectedTrackGroupForVideo] = useState<any | null>(null);
   const [activeVideoSegmentId, setActiveVideoSegmentId] = useState<number | string | null>(null);
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
@@ -1499,6 +1562,10 @@ function MapPageContent() {
   // Crack dots view state
   const [mapViewMode, setMapViewMode] = useState<MapViewMode>('segments');
   const [crackDotsData, setCrackDotsData] = useState<CrackDotData[]>([]);
+  const ALL_DEFECT_TYPES = ['pothole', 'alligator', 'longitudinal', 'transverse', 'sealed_crack'];
+  const [activeDefectTypes, setActiveDefectTypes] = useState<Set<string>>(new Set(ALL_DEFECT_TYPES));
+  // 0 = show all; 90 = show only top 10% biggest (per defect type independently)
+  const [minSizePercentile, setMinSizePercentile] = useState<number>(0);
 
   // State for sidebar in parent to control map width
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -1521,6 +1588,42 @@ function MapPageContent() {
       return sum;
     }, 0);
   }, [geojson]);
+  // Best available size metric: area_px if set, else width*length, else whichever exists
+  const getDefectSize = (c: CrackDotData): number => {
+    const m = c.measurements;
+    if (!m) return 0;
+    if (m.area_px != null && m.area_px > 0) return m.area_px;
+    const w = m.width_px ?? 0;
+    const l = m.length_px ?? 0;
+    if (w > 0 && l > 0) return w * l;
+    return Math.max(w, l);
+  };
+
+  const sizeThresholdByType = useMemo(() => {
+    if (minSizePercentile <= 0) return {} as Record<string, number>;
+    const topFraction = (100 - minSizePercentile) / 100;
+    const thresholds: Record<string, number> = {};
+    for (const type of ALL_DEFECT_TYPES) {
+      const sizes = crackDotsData
+        .filter(c => c.defect_type === type)
+        .map(c => getDefectSize(c))
+        .sort((a, b) => b - a);
+      if (sizes.length === 0) { thresholds[type] = 0; continue; }
+      const cutoffIndex = Math.ceil(sizes.length * topFraction) - 1;
+      thresholds[type] = sizes[Math.max(0, cutoffIndex)] ?? 0;
+    }
+    return thresholds;
+  }, [crackDotsData, minSizePercentile]);
+
+  const filteredCrackDotsData = useMemo(
+    () => crackDotsData.filter(c => {
+      if (!activeDefectTypes.has(c.defect_type)) return false;
+      if (minSizePercentile <= 0) return true;
+      const threshold = sizeThresholdByType[c.defect_type] ?? 0;
+      return getDefectSize(c) >= threshold;
+    }),
+    [crackDotsData, activeDefectTypes, minSizePercentile, sizeThresholdByType]
+  );
   const videoSegmentJobKeys = useMemo(() => Object.keys(jobVideoSegments), [jobVideoSegments]);
   const selectedTrackGroupJobIds = useMemo(
     () => deriveJobIdsFromTrackGroup(selectedTrackGroupForVideo),
@@ -1539,13 +1642,37 @@ function MapPageContent() {
     if (!selectedTrackGroupForVideo || !activeVideoJobEntry?.segmentsIndex?.segments) {
       return null;
     }
-    const midpoint = getTrackGroupMidpoint(selectedTrackGroupForVideo);
-    if (!midpoint) {
-      return null;
+    const allVideoSegs: any[] = activeVideoJobEntry.segmentsIndex.segments || [];
+
+    // Try overlap-based matching using distance_start_miles / distance_end_miles
+    const selectedStartMi = (selectedTrackGroupForVideo.start_feet ?? 0) / 5280;
+    const selectedEndMi = (selectedTrackGroupForVideo.end_feet ?? selectedTrackGroupForVideo.start_feet ?? 0) / 5280;
+    const overlapping = allVideoSegs.filter(
+      (v: any) =>
+        typeof v.distance_start_miles === 'number' &&
+        typeof v.distance_end_miles === 'number' &&
+        v.distance_start_miles < selectedEndMi &&
+        v.distance_end_miles > selectedStartMi
+    );
+    if (overlapping.length > 0) {
+      // Return the clip with the most overlap
+      let best = overlapping[0];
+      let bestOverlap = 0;
+      for (const v of overlapping) {
+        const overlapStart = Math.max(selectedStartMi, v.distance_start_miles);
+        const overlapEnd = Math.min(selectedEndMi, v.distance_end_miles);
+        const overlap = overlapEnd - overlapStart;
+        if (overlap > bestOverlap) { bestOverlap = overlap; best = v; }
+      }
+      return best;
     }
+
+    // Fallback: midpoint-proximity matching
+    const midpoint = getTrackGroupMidpoint(selectedTrackGroupForVideo);
+    if (!midpoint) return null;
     let bestSegment: any = null;
     let bestDistance = Number.POSITIVE_INFINITY;
-    (activeVideoJobEntry.segmentsIndex.segments || []).forEach((segment: any) => {
+    allVideoSegs.forEach((segment: any) => {
       const segmentMidpoint = getVideoSegmentMidpoint(segment);
       const distanceMeters = distanceBetweenCoordsMeters(midpoint, segmentMidpoint);
       if (distanceMeters < bestDistance) {
@@ -1654,13 +1781,40 @@ function MapPageContent() {
       canUseHlsJs,
     });
 
+    // Compute seek start/end times based on selected segment vs video clip boundaries
+    const clipStartMi: number = activeVideoSegment?.distance_start_miles ?? 0;
+    const clipEndMi: number = activeVideoSegment?.distance_end_miles ?? 0;
+    const clipLengthMi = clipEndMi - clipStartMi;
+    const clipDuration: number = activeVideoSegment?.duration_seconds ?? 0;
+    const selectedStartMi = (selectedTrackGroupForVideo?.start_feet ?? 0) / 5280;
+    const selectedEndMi = (selectedTrackGroupForVideo?.end_feet ?? selectedTrackGroupForVideo?.start_feet ?? 0) / 5280;
+
+    let seekStartTime = 0;
+    let seekEndTime = clipDuration;
+    if (clipDuration > 0 && clipLengthMi > 0) {
+      const offsetStartMi = Math.max(selectedStartMi - clipStartMi, 0);
+      const offsetEndMi = Math.min(selectedEndMi, clipEndMi) - clipStartMi;
+      seekStartTime = (offsetStartMi / clipLengthMi) * clipDuration;
+      seekEndTime = (offsetEndMi / clipLengthMi) * clipDuration;
+    }
+
+    let stopHandler: (() => void) | null = null;
+    const applySeek = () => {
+      if (seekStartTime > 0) videoElement.currentTime = seekStartTime;
+      if (seekEndTime < clipDuration && seekEndTime > seekStartTime) {
+        stopHandler = () => {
+          if (videoElement.currentTime >= seekEndTime) videoElement.pause();
+        };
+        videoElement.addEventListener('timeupdate', stopHandler);
+      }
+    };
+
     if (canUseHlsJs) {
       console.log('[map] Using hls.js for playback.');
       hlsInstance = new Hls({ enableWorker: true });
       hlsInstance.on(Hls.Events.ERROR, (_event, data) => {
         console.error('[map] HLS.js error.', data);
       });
-      // Force highest quality level and prevent ABR from switching
       hlsInstance.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
         if (hlsInstance && data.levels.length > 0) {
           const highestLevel = data.levels.length - 1;
@@ -1671,9 +1825,11 @@ function MapPageContent() {
       });
       hlsInstance.loadSource(masterUrl);
       hlsInstance.attachMedia(videoElement);
+      videoElement.addEventListener('loadedmetadata', applySeek, { once: true });
     } else if (canUseNative) {
       console.log('[map] Falling back to native HLS playback.');
       videoElement.src = masterUrl;
+      videoElement.addEventListener('loadedmetadata', applySeek, { once: true });
       videoElement.play().catch(() => {});
     } else {
       console.warn('[map] Neither native HLS nor hls.js supported; falling back to assigning src.');
@@ -1682,11 +1838,12 @@ function MapPageContent() {
 
     return () => {
       videoElement.removeEventListener('error', handleVideoError);
+      if (stopHandler) videoElement.removeEventListener('timeupdate', stopHandler);
       if (hlsInstance) {
         hlsInstance.destroy();
       }
     };
-  }, [activeVideoSegment?.hls?.master_playlist_url, activeVideoSegment?.segment_id]);
+  }, [activeVideoSegment?.hls?.master_playlist_url, activeVideoSegment?.segment_id, selectedTrackGroupForVideo?.start_feet, selectedTrackGroupForVideo?.end_feet]);
 
   const getSidebarWidth = () => {
     if (screenSize.width >= 1920) return 2400; // 1600 * 1.5
@@ -1717,10 +1874,34 @@ function MapPageContent() {
     setError(null);
     setSelectedTrackGroupForVideo(null);
     setActiveVideoSegmentId(null);
-    // Clear crack dots data
     setCrackDotsData([]);
-    setMapViewMode('segments'); // Reset to default view
+    setMapViewMode('segments');
   }, [targetConfig.prefix]);
+
+  // Recompute segments whenever segment size changes (uses already-loaded in-memory data)
+  useEffect(() => {
+    if (!rawParentTrackFeatures.length || !isParentTrackDataset(rawParentTrackFeatures)) return;
+    const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(
+      rawParentTrackFeatures, gpsFrameMappings, jobVideoSegments, frameDamageMappings, segmentLengthFeet
+    );
+    const combinedFeatures = [...lineFeatures, ...defectPointFeatures];
+    if (combinedFeatures.length > 0) {
+      setGeojson({
+        type: 'FeatureCollection',
+        features: combinedFeatures,
+        metadata: { processedAt: new Date().toISOString() },
+      });
+      if (lineFeatures.length > 0) {
+        try {
+          const cracks = extractIndividualCracks({ type: 'FeatureCollection', features: combinedFeatures });
+          setCrackDotsData(cracks);
+        } catch {
+          setCrackDotsData([]);
+        }
+      }
+    }
+    setSelectedTrackGroupForVideo(null);
+  }, [segmentLengthFeet]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const parseS3Xml = (xmlText: string) => {
     const parser = new DOMParser();
@@ -1908,6 +2089,30 @@ function MapPageContent() {
     return entries;
   };
 
+  const loadFrameDamageMappingsForJobPrefixes = async (
+    jobPrefixes: string[]
+  ): Promise<Record<string, FrameDamageMapping>> => {
+    if (!Array.isArray(jobPrefixes) || jobPrefixes.length === 0) return {};
+    const entries: Record<string, FrameDamageMapping> = {};
+    await Promise.all(jobPrefixes.map(async jobPrefix => {
+      const normalized = ensureTrailingSlash(jobPrefix);
+      const jobId = deriveJobIdFromPrefix(normalized);
+      const url = `${S3_HTTP_BASE_URL}/${normalized}data/frame_to_damage_pixel_mapping.json`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data?.frames) {
+          entries[jobId] = { jobId, jobPrefix: normalized, frames: data.frames };
+          console.log(`[map] Loaded frame damage mapping for job ${jobId}`);
+        }
+      } catch (err) {
+        console.warn(`No frame damage mapping for ${normalized}`, err);
+      }
+    }));
+    return entries;
+  };
+
   async function listMetadataGeojsonUrls(prefix: string): Promise<GeojsonListingResult> {
     const prefixes = await listCommonPrefixes(prefix);
 
@@ -1975,6 +2180,12 @@ function MapPageContent() {
     setGeojson(null);
     setJobVideoSegments({});
     setGpsFrameMappings({});
+    setFrameDamageMappings({});
+    setRawParentTrackFeatures([]);
+    setSegmentLengthFeet(528);
+    setCustomSegmentInput('');
+    setActiveDefectTypes(new Set(ALL_DEFECT_TYPES));
+    setMinSizePercentile(0);
     setSelectedTrackGroupForVideo(null);
     setActiveVideoSegmentId(null);
 
@@ -1994,6 +2205,7 @@ function MapPageContent() {
       const failedUrls: string[] = [];
       const videoSegmentsPromise = loadVideoSegmentsForJobPrefixes(jobPrefixes);
       const gpsFrameMappingsPromise = loadGpsFrameMappingsForJobPrefixes(jobPrefixes);
+      const frameDamageMappingsPromise = loadFrameDamageMappingsForJobPrefixes(jobPrefixes);
 
       const fetchPromises = geojsonUrls.map(async (geojsonUrl, index) => {
         try {
@@ -2024,17 +2236,21 @@ function MapPageContent() {
       });
 
       await Promise.allSettled(fetchPromises);
-      const [loadedVideoSegments, loadedGpsFrameMappings] = await Promise.all([
+      const [loadedVideoSegments, loadedGpsFrameMappings, loadedFrameDamageMappings] = await Promise.all([
         videoSegmentsPromise,
         gpsFrameMappingsPromise,
+        frameDamageMappingsPromise,
       ]);
       setJobVideoSegments(loadedVideoSegments);
       setGpsFrameMappings(loadedGpsFrameMappings);
+      setFrameDamageMappings(loadedFrameDamageMappings);
       console.log(`[map] Loaded video segments for ${Object.keys(loadedVideoSegments).length} job(s).`);
       console.log(`[map] Loaded GPS frame mappings for ${Object.keys(loadedGpsFrameMappings).length} job(s).`);
+      console.log(`[map] Loaded frame damage mappings for ${Object.keys(loadedFrameDamageMappings).length} job(s).`);
 
       if (isParentTrackDataset(allFeatures)) {
-        const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(allFeatures, loadedGpsFrameMappings, loadedVideoSegments);
+        setRawParentTrackFeatures(allFeatures);
+        const { lineFeatures, defectPointFeatures } = convertParentTracksToFeatures(allFeatures, loadedGpsFrameMappings, loadedVideoSegments, loadedFrameDamageMappings, 528);
         const combinedFeatures = [...lineFeatures, ...defectPointFeatures];
 
         if (combinedFeatures.length > 0) {
@@ -2216,12 +2432,8 @@ function MapPageContent() {
                     justifyContent: 'center',
                     gap: '0.5rem'
                   }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.opacity = '0.9';
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.opacity = '1';
-                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.opacity = '0.9'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.opacity = '1'; }}
                 >
                   <span style={{ fontSize: '1.1rem' }}>
                     {mapViewMode === 'cracks' ? '🔴' : '🛣️'}
@@ -2232,14 +2444,126 @@ function MapPageContent() {
                 </button>
               )}
 
+              {/* Segment size controls — shown in segments view when data is loaded */}
+              {geojson && mapViewMode === 'segments' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.8rem', color: '#6b7280', fontWeight: 500 }}>Segment:</span>
+                  {([['0.1 mi', 528], ['0.5 mi', 2640], ['1 mi', 5280]] as [string, number][]).map(([label, val]) => (
+                    <button
+                      key={val}
+                      onClick={() => { setSegmentLengthFeet(val); setCustomSegmentInput(''); }}
+                      style={{
+                        background: segmentLengthFeet === val && !customSegmentInput ? '#2563eb' : '#e5e7eb',
+                        color: segmentLengthFeet === val && !customSegmentInput ? 'white' : '#374151',
+                        border: 'none',
+                        borderRadius: '6px',
+                        padding: '0.25rem 0.6rem',
+                        fontSize: '0.8rem',
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                  <input
+                    type="number"
+                    min="1"
+                    placeholder="Custom ft"
+                    value={customSegmentInput}
+                    onChange={e => setCustomSegmentInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        const val = parseInt(customSegmentInput, 10);
+                        if (val > 0) setSegmentLengthFeet(val);
+                      }
+                    }}
+                    onBlur={() => {
+                      const val = parseInt(customSegmentInput, 10);
+                      if (val > 0) setSegmentLengthFeet(val);
+                    }}
+                    style={{
+                      width: '90px',
+                      padding: '0.25rem 0.5rem',
+                      border: '1px solid #d1d5db',
+                      borderRadius: '6px',
+                      fontSize: '0.8rem',
+                      outline: 'none',
+                    }}
+                  />
+                </div>
+              )}
+
+              {/* Defect type filter pills — shown in cracks view */}
+              {geojson && mapViewMode === 'cracks' && crackDotsData.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.8rem', color: '#6b7280', fontWeight: 500 }}>Filter:</span>
+                  {([
+                    ['pothole', '#dc2626'],
+                    ['alligator', '#ea580c'],
+                    ['longitudinal', '#fb923c'],
+                    ['transverse', '#fbbf24'],
+                    ['sealed_crack', '#6b7280'],
+                  ] as [string, string][]).map(([type, color]) => {
+                    const active = activeDefectTypes.has(type);
+                    return (
+                      <button
+                        key={type}
+                        onClick={() => {
+                          setActiveDefectTypes(prev => {
+                            const next = new Set(prev);
+                            if (next.has(type)) { next.delete(type); } else { next.add(type); }
+                            return next;
+                          });
+                        }}
+                        style={{
+                          background: active ? color : 'transparent',
+                          color: active ? 'white' : '#6b7280',
+                          border: `1.5px solid ${active ? color : '#d1d5db'}`,
+                          borderRadius: '999px',
+                          padding: '0.2rem 0.65rem',
+                          fontSize: '0.78rem',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          textTransform: 'capitalize',
+                        }}
+                      >
+                        {type.replace('_', ' ')}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Size filter slider — shown in cracks view */}
+              {geojson && mapViewMode === 'cracks' && crackDotsData.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                  <span style={{ fontSize: '0.8rem', color: '#6b7280', fontWeight: 500 }}>Defect size:</span>
+                  <span style={{ fontSize: '0.75rem', color: '#9ca3af' }}>small</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={90}
+                    step={10}
+                    value={minSizePercentile}
+                    onChange={e => setMinSizePercentile(Number(e.target.value))}
+                    style={{ width: '110px', accentColor: '#3b82f6', cursor: 'pointer' }}
+                  />
+                  <span style={{ fontSize: '0.75rem', color: '#9ca3af' }}>big</span>
+                  {minSizePercentile > 0 && (
+                    <span style={{ fontSize: '0.75rem', color: '#6b7280' }}>
+                      (top {100 - minSizePercentile}%)
+                    </span>
+                  )}
+                </div>
+              )}
+
               {/* Show defect count */}
               {crackDotsData.length > 0 && (
-                <span style={{
-                  color: '#6b7280',
-                  fontSize: '0.9rem',
-                  fontWeight: '500'
-                }}>
-                  {crackDotsData.length.toLocaleString()} defects detected
+                <span style={{ color: '#6b7280', fontSize: '0.9rem', fontWeight: '500' }}>
+                  {mapViewMode === 'cracks'
+                    ? `${filteredCrackDotsData.length.toLocaleString()} / ${crackDotsData.length.toLocaleString()} defects`
+                    : `${crackDotsData.length.toLocaleString()} defects detected`}
                 </span>
               )}
 
@@ -2415,7 +2739,8 @@ function MapPageContent() {
             sidebarWidth={sidebarWidth}
             onSegmentSelected={handleSegmentSelectionChange}
             viewMode={mapViewMode}
-            crackDotsData={crackDotsData}
+            crackDotsData={filteredCrackDotsData}
+            frameDamageMappings={frameDamageMappings}
           />
         </div>
       </div>

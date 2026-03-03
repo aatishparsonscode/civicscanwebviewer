@@ -99,7 +99,6 @@ interface GridCell {
 }
 
 const GRID_COLS = 6;
-const GRID_ROWS = 10;
 const FRAME_WIDTH_4K = 3840;
 
 /**
@@ -154,6 +153,9 @@ export default function RoadGridVisualization({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [gridCells, setGridCells] = useState<GridCell[][]>([]);
   const [selectedCell, setSelectedCell] = useState<GridCell | null>(null);
+
+  // Dynamic row count: 1 row per 50 ft, capped at 10 rows
+  const GRID_ROWS = Math.min(10, Math.max(1, Math.ceil((segmentEndFeet - segmentStartFeet) / 50)));
 
   // Clear selected cell when segment changes
   useEffect(() => {
@@ -527,8 +529,6 @@ export default function RoadGridVisualization({
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                     <div style={{ fontSize: '0.85rem', color: '#374151' }}>
                       <span style={{ fontWeight: 600, textTransform: 'capitalize' }}>{defect.defect_type}</span>
-                      {' · '}
-                      <span>Severity: {defect.severity.joint_severity}</span>
                     </div>
                     <div style={{ fontSize: '0.75rem', color: '#6b7280' }}>
                       ID: {defect.defect_id}
